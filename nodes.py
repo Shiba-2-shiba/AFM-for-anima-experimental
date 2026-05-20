@@ -8,11 +8,14 @@ from comfy_api.latest import ComfyExtension, io
 
 from .anima_afm import (
     AFMConfig,
+    AFM_MODES,
     AnimaAFMAttentionOverride,
     BRANCH_MODES,
     DEBUG_LEVELS,
     FAIL_MODES,
     SCHEDULES,
+    SPECTRAL_DIAG_MODES,
+    ZERO_STRENGTH_MODES,
     is_anima_like_model,
 )
 
@@ -32,12 +35,14 @@ class AnimaAFMModelPatch(io.ComfyNode):
             is_experimental=True,
             inputs=[
                 io.Model.Input("model"),
+                io.Combo.Input("mode", options=AFM_MODES, default="edit"),
                 io.Float.Input("strength", default=0.2, min=-1.0, max=2.0, step=0.01),
                 io.Float.Input("cutoff", default=0.25, min=0.01, max=0.95, step=0.01),
                 io.Float.Input("start_percent", default=0.0, min=0.0, max=1.0, step=0.01),
                 io.Float.Input("end_percent", default=1.0, min=0.0, max=1.0, step=0.01),
                 io.Combo.Input("schedule", options=SCHEDULES, default="curve"),
                 io.Combo.Input("branch_mode", options=BRANCH_MODES, default="both"),
+                io.Combo.Input("zero_strength_mode", options=ZERO_STRENGTH_MODES, default="observe", advanced=True),
                 io.Boolean.Input("entropy_gate", default=False),
                 io.Float.Input("beta", default=20.0, min=0.0, max=100.0, step=0.1, advanced=True),
                 io.Float.Input("gamma", default=4.0, min=0.0, max=100.0, step=0.1, advanced=True),
@@ -46,6 +51,8 @@ class AnimaAFMModelPatch(io.ComfyNode):
                 io.Float.Input("mask_width", default=0.05, min=0.0, max=0.5, step=0.01, advanced=True),
                 io.Combo.Input("debug_level", options=DEBUG_LEVELS, default="off", advanced=True),
                 io.Combo.Input("fail_mode", options=FAIL_MODES, default="fallback", advanced=True),
+                io.Float.Input("max_logits_mib", default=1024.0, min=1.0, max=65536.0, step=16.0, advanced=True),
+                io.Combo.Input("spectral_diag", options=SPECTRAL_DIAG_MODES, default="off", advanced=True),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -56,12 +63,14 @@ class AnimaAFMModelPatch(io.ComfyNode):
     def execute(
         cls,
         model,
+        mode,
         strength,
         cutoff,
         start_percent,
         end_percent,
         schedule,
         branch_mode,
+        zero_strength_mode,
         entropy_gate,
         beta,
         gamma,
@@ -70,17 +79,21 @@ class AnimaAFMModelPatch(io.ComfyNode):
         mask_width,
         debug_level,
         fail_mode,
+        max_logits_mib,
+        spectral_diag,
     ) -> io.NodeOutput:
         if not is_anima_like_model(model):
             raise ValueError("Anima AFM Model Patch requires an Anima MODEL. The connected model does not look Anima-like.")
 
         config = AFMConfig(
+            mode=mode,
             strength=strength,
             cutoff=cutoff,
             start_percent=start_percent,
             end_percent=end_percent,
             schedule=schedule,
             branch_mode=branch_mode,
+            zero_strength_mode=zero_strength_mode,
             entropy_gate=entropy_gate,
             beta=beta,
             gamma=gamma,
@@ -89,6 +102,8 @@ class AnimaAFMModelPatch(io.ComfyNode):
             mask_width=mask_width,
             debug_level=debug_level,
             fail_mode=fail_mode,
+            max_logits_mib=max_logits_mib,
+            spectral_diag=spectral_diag,
         )
         config.validate()
 
@@ -98,7 +113,15 @@ class AnimaAFMModelPatch(io.ComfyNode):
             raise ValueError("Anima AFM cannot be combined with an existing optimized_attention_override patch yet.")
 
         transformer_options["optimized_attention_override"] = AnimaAFMAttentionOverride(config)
-        LOGGER.info("[AnimaAFM] installed model patch strength=%s cutoff=%s schedule=%s branch_mode=%s", strength, cutoff, schedule, branch_mode)
+        LOGGER.info(
+            "[AnimaAFM] installed model patch mode=%s strength=%s cutoff=%s schedule=%s branch_mode=%s zero_strength_mode=%s",
+            mode,
+            strength,
+            cutoff,
+            schedule,
+            branch_mode,
+            zero_strength_mode,
+        )
         return io.NodeOutput(patched)
 
 

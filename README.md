@@ -14,21 +14,33 @@ Connect it after the Anima model loader and before sampling.
 
 Use a fixed seed, fixed prompt, fixed sampler, and fixed latent.
 
-Recommended sweep:
+Recommended protocol:
 
 ```text
-strength: -0.2, 0.0, 0.1, 0.2, 0.4
-schedule: curve
-branch_mode: both, then positive_only
-entropy_gate: false first
+1. True baseline: no AFM node.
+2. Observe baseline: AFM node mode=observe, strength=0.0, debug_level=summary.
+   Expected: image should match true baseline; log should show eligible shapes but edited=0.
+3. Manual no-op diagnostic: mode=edit, strength=0.0, zero_strength_mode=manual only for testing.
+   Expected: may differ slightly from true baseline due to manual attention backend; do not use as image baseline.
+4. Edit sweep: mode=edit, entropy_gate=false, strength=0.05, 0.1, 0.2.
+5. Branch sweep after branch preservation fix: branch_mode=both, positive_only, negative_only.
+6. Spectral debug: spectral_diag=sampled for one short run only.
 ```
 
-`strength=0.0` should match the baseline. Enable `debug_level=summary` to confirm that Anima/Cosmos cross-attention calls are edited and to inspect inferred tensor shapes.
+Expected final-step summary for a 24-step square Anima text-to-image run with `strength=0.2`, `schedule=curve`, and `entropy_gate=false`:
+
+```text
+[AnimaAFM] step_summary step_index=23 num_steps=24 last_index=23 u=1.0000 ...
+q=(2, 16, 4096, 128) k=(2, 16, 512, 128) ... spatial=(64, 64)
+alpha_lf=1.0000 alpha_hf=1.2000
+```
+
+Summary logs include per-step fallback reason histograms, CFG branch layout (`cond_or_uncond`), selected indices, selected count, and the estimated temporary logits size. Use `mode=observe` to confirm eligible Anima/Cosmos cross-attention shapes without replacing the original attention backend.
 
 ## Limits
 
 - The MVP only edits square image query grids.
 - Non-square/video query layouts fall back to the original attention.
 - If another node already installs `optimized_attention_override`, this node raises a clear error.
-- Full pre-softmax logits are materialized, so high resolutions may need a later chunked implementation.
+- Full pre-softmax logits are materialized for edited calls. `max_logits_mib` guards high-memory shapes until a later chunked implementation exists.
 

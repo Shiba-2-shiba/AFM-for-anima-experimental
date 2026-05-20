@@ -35,20 +35,49 @@ class CountingAttention:
         return reference_attention(*args, **kwargs)
 
 
+class SentinelAttention:
+    def __init__(self):
+        self.calls = 0
+        self.reference_output = None
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        out = reference_attention(*args, **kwargs)
+        offsets = torch.arange(out.shape[0], device=out.device, dtype=out.dtype).reshape(
+            out.shape[0],
+            *([1] * (out.ndim - 1)),
+        )
+        self.reference_output = out + offsets * 1000.0
+        return self.reference_output
+
+
 class AnimaAFMTests(unittest.TestCase):
     def test_infer_square_spatial_shape(self):
         self.assertEqual(infer_square_spatial_shape(64), (8, 8))
         self.assertIsNone(infer_square_spatial_shape(65))
 
-    def test_progress_from_sigmas(self):
+    def test_progress_last_model_step_reaches_one(self):
         info = progress_from_sigmas({
             "sigmas": torch.tensor([0.5]),
             "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
         })
         self.assertIsNotNone(info)
         self.assertEqual(info.index, 1)
-        self.assertEqual(info.total, 2)
-        self.assertAlmostEqual(info.progress, 0.5)
+        self.assertEqual(info.num_steps, 2)
+        self.assertEqual(info.last_index, 1)
+        self.assertAlmostEqual(info.progress, 1.0)
+
+    def test_progress_24_steps_last_index(self):
+        sample_sigmas = torch.linspace(1.0, 0.0, 25)
+        info = progress_from_sigmas({
+            "sigmas": sample_sigmas[23:24],
+            "sample_sigmas": sample_sigmas,
+        })
+        self.assertIsNotNone(info)
+        self.assertEqual(info.index, 23)
+        self.assertEqual(info.num_steps, 24)
+        self.assertEqual(info.last_index, 23)
+        self.assertAlmostEqual(info.progress, 1.0)
 
     def test_schedule_alphas(self):
         config = AFMConfig(strength=0.2, schedule="curve")
@@ -95,7 +124,7 @@ class AnimaAFMTests(unittest.TestCase):
                 "cond_or_uncond": [1, 0],
             },
         }
-        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.0))
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.0, zero_strength_mode="manual"))
         out = override(reference_attention, q, k, v, 2, **kwargs)
         expected = reference_attention(q, k, v, 2, **kwargs)
         self.assertTrue(torch.allclose(out, expected, atol=1e-5, rtol=1e-5))
@@ -112,7 +141,7 @@ class AnimaAFMTests(unittest.TestCase):
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
             },
         }
-        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.0, entropy_gate=True))
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.0, entropy_gate=True, zero_strength_mode="manual"))
         out = override(reference_attention, q, k, v, 2, **kwargs)
         expected = reference_attention(q, k, v, 2, **kwargs)
         self.assertTrue(torch.allclose(out, expected, atol=1e-5, rtol=1e-5))
@@ -137,6 +166,156 @@ class AnimaAFMTests(unittest.TestCase):
             },
         )
         self.assertEqual(tuple(out.shape), (2, 16, 8))
+
+    def test_observe_mode_returns_original_and_records_eligible(self):
+        torch.manual_seed(22)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        original = SentinelAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(mode="observe", strength=0.2))
+        kwargs = {
+            "skip_reshape": True,
+            "transformer_options": {
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+                "cond_or_uncond": [1, 0],
+            },
+        }
+        out = override(original, q, k, v, 2, **kwargs)
+        self.assertTrue(torch.equal(out, original.reference_output))
+        self.assertEqual(original.calls, 1)
+        self.assertEqual(override.stats.observed_calls, 1)
+        self.assertEqual(override.stats.edited_calls, 0)
+        self.assertEqual(override.stats.steps[1].observed_calls, 1)
+
+    def test_positive_only_preserves_negative_branch_original_backend(self):
+        torch.manual_seed(23)
+        q = torch.randn(4, 2, 16, 4)
+        k = torch.randn(4, 2, 5, 4)
+        v = torch.randn(4, 2, 5, 4)
+        original = SentinelAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2, branch_mode="positive_only"))
+        kwargs = {
+            "skip_reshape": True,
+            "transformer_options": {
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+                "cond_or_uncond": [1, 0],
+            },
+        }
+        out = override(original, q, k, v, 2, **kwargs)
+        self.assertEqual(original.calls, 1)
+        self.assertTrue(torch.equal(out[:2], original.reference_output[:2]))
+        self.assertFalse(torch.equal(out[2:], original.reference_output[2:]))
+
+    def test_negative_only_preserves_positive_branch_original_backend(self):
+        torch.manual_seed(24)
+        q = torch.randn(4, 2, 16, 4)
+        k = torch.randn(4, 2, 5, 4)
+        v = torch.randn(4, 2, 5, 4)
+        original = SentinelAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2, branch_mode="negative_only"))
+        kwargs = {
+            "skip_reshape": True,
+            "transformer_options": {
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+                "cond_or_uncond": [1, 0],
+            },
+        }
+        out = override(original, q, k, v, 2, **kwargs)
+        self.assertEqual(original.calls, 1)
+        self.assertFalse(torch.equal(out[:2], original.reference_output[:2]))
+        self.assertTrue(torch.equal(out[2:], original.reference_output[2:]))
+
+    def test_branch_layout_unknown_falls_back_for_selected_modes(self):
+        q = torch.randn(4, 2, 16, 4)
+        k = torch.randn(4, 2, 5, 4)
+        v = torch.randn(4, 2, 5, 4)
+        original = CountingAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2, branch_mode="positive_only"))
+        override(
+            original,
+            q,
+            k,
+            v,
+            2,
+            skip_reshape=True,
+            transformer_options={
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+            },
+        )
+        self.assertEqual(original.calls, 1)
+        self.assertEqual(override.stats.fallback_reasons["branch_layout_unknown"], 1)
+
+    def test_gqa_repeats_kv_heads(self):
+        torch.manual_seed(25)
+        q = torch.randn(2, 8, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2))
+        out = override(
+            reference_attention,
+            q,
+            k,
+            v,
+            8,
+            skip_reshape=True,
+            skip_output_reshape=True,
+            enable_gqa=True,
+            transformer_options={
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+            },
+        )
+        self.assertEqual(tuple(out.shape), (2, 8, 16, 4))
+        self.assertEqual(override.stats.edited_calls, 1)
+
+    def test_vram_guard_falls_back(self):
+        q = torch.randn(1, 2, 16, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        original = CountingAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2, max_logits_mib=0.0001))
+        override(
+            original,
+            q,
+            k,
+            v,
+            2,
+            skip_reshape=True,
+            transformer_options={
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+            },
+        )
+        self.assertEqual(original.calls, 1)
+        self.assertEqual(override.stats.fallback_reasons["vram_guard_exceeded"], 1)
+
+    def test_spectral_diag_reports_rho_delta(self):
+        torch.manual_seed(26)
+        q = torch.randn(1, 2, 16, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2, spectral_diag="sampled"))
+        override(
+            reference_attention,
+            q,
+            k,
+            v,
+            2,
+            skip_reshape=True,
+            transformer_options={
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+            },
+        )
+        step = override.stats.steps[1]
+        self.assertIsNotNone(step.rho_before)
+        self.assertIsNotNone(step.rho_after)
+        self.assertIsNotNone(step.delta_rho)
 
     def test_self_attention_falls_back(self):
         torch.manual_seed(3)
