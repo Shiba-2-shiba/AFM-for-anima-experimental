@@ -11,7 +11,9 @@ from .anima_afm import (
     AFM_MODES,
     AnimaAFMAttentionOverride,
     BRANCH_MODES,
+    DEBUG_FORMATS,
     DEBUG_LEVELS,
+    DIAGNOSTIC_BRANCHES,
     FAIL_MODES,
     SCHEDULES,
     SPECTRAL_DIAG_MODES,
@@ -50,9 +52,12 @@ class AnimaAFMModelPatch(io.ComfyNode):
                 io.Boolean.Input("soft_mask", default=True, advanced=True),
                 io.Float.Input("mask_width", default=0.05, min=0.0, max=0.5, step=0.01, advanced=True),
                 io.Combo.Input("debug_level", options=DEBUG_LEVELS, default="off", advanced=True),
+                io.Combo.Input("debug_format", options=DEBUG_FORMATS, default="text", advanced=True),
                 io.Combo.Input("fail_mode", options=FAIL_MODES, default="fallback", advanced=True),
                 io.Float.Input("max_logits_mib", default=1024.0, min=1.0, max=65536.0, step=16.0, advanced=True),
                 io.Combo.Input("spectral_diag", options=SPECTRAL_DIAG_MODES, default="off", advanced=True),
+                io.Combo.Input("diagnostic_branch", options=DIAGNOSTIC_BRANCHES, default="both_separate", advanced=True),
+                io.Int.Input("max_verbose_fallbacks_per_step_per_reason", default=3, min=0, max=100, step=1, advanced=True),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -78,9 +83,12 @@ class AnimaAFMModelPatch(io.ComfyNode):
         soft_mask,
         mask_width,
         debug_level,
+        debug_format,
         fail_mode,
         max_logits_mib,
         spectral_diag,
+        diagnostic_branch,
+        max_verbose_fallbacks_per_step_per_reason,
     ) -> io.NodeOutput:
         if not is_anima_like_model(model):
             raise ValueError("Anima AFM Model Patch requires an Anima MODEL. The connected model does not look Anima-like.")
@@ -101,9 +109,12 @@ class AnimaAFMModelPatch(io.ComfyNode):
             soft_mask=soft_mask,
             mask_width=mask_width,
             debug_level=debug_level,
+            debug_format=debug_format,
             fail_mode=fail_mode,
             max_logits_mib=max_logits_mib,
             spectral_diag=spectral_diag,
+            diagnostic_branch=diagnostic_branch,
+            max_verbose_fallbacks_per_step_per_reason=max_verbose_fallbacks_per_step_per_reason,
         )
         config.validate()
 

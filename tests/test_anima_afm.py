@@ -1,3 +1,4 @@
+import json
 import math
 import unittest
 
@@ -52,6 +53,25 @@ class SentinelAttention:
 
 
 class AnimaAFMTests(unittest.TestCase):
+    def _cfg_kwargs(self, sigma):
+        return {
+            "skip_reshape": True,
+            "transformer_options": {
+                "sigmas": torch.tensor([sigma]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+                "cond_or_uncond": [1, 0],
+            },
+        }
+
+    def _json_log_records(self, records):
+        parsed = []
+        for record in records:
+            try:
+                parsed.append(json.loads(record.getMessage()))
+            except json.JSONDecodeError:
+                pass
+        return parsed
+
     def test_infer_square_spatial_shape(self):
         self.assertEqual(infer_square_spatial_shape(64), (8, 8))
         self.assertIsNone(infer_square_spatial_shape(65))
@@ -316,6 +336,119 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertIsNotNone(step.rho_before)
         self.assertIsNotNone(step.rho_after)
         self.assertIsNotNone(step.delta_rho)
+
+    def test_branch_aware_spectral_diag_uses_cfg_batch_indices(self):
+        torch.manual_seed(27)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(
+            strength=0.2,
+            spectral_diag="sampled",
+            diagnostic_branch="both_separate",
+            debug_level="summary",
+            debug_format="jsonl",
+        ))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+        records = self._json_log_records(logs.records)
+        spectral = [record for record in records if record["record_type"] == "spectral_diag"]
+        by_branch = {record["diagnostic_branch"]: record for record in spectral}
+        self.assertEqual(by_branch["negative"]["batch_indices"], [0])
+        self.assertEqual(by_branch["positive"]["batch_indices"], [1])
+        self.assertEqual(override.stats.steps[1].spectral_diagnostics["negative"].batch_indices, [0])
+        self.assertEqual(override.stats.steps[1].spectral_diagnostics["positive"].batch_indices, [1])
+
+    def test_step_final_summary_counts_fallback_after_snapshot_once(self):
+        torch.manual_seed(28)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        q_self = torch.randn(2, 2, 16, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="summary", debug_format="jsonl"))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(1.0))
+            override(reference_attention, q_self, q_self, q_self, 2, **self._cfg_kwargs(1.0))
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+        records = self._json_log_records(logs.records)
+        final_step_zero = [
+            record for record in records
+            if record["record_type"] == "step_final_summary" and record["step_index"] == 0
+        ]
+        self.assertEqual(len(final_step_zero), 1)
+        self.assertEqual(final_step_zero[0]["fallbacks"], 1)
+        self.assertEqual(final_step_zero[0]["fallback_reasons"], {"not_cross_attention": 1})
+
+    def test_eligible_call_index_and_block_metadata_are_logged(self):
+        torch.manual_seed(29)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="verbose", debug_format="jsonl"))
+        kwargs = self._cfg_kwargs(0.5)
+        kwargs["transformer_options"] = {
+            **kwargs["transformer_options"],
+            "block": ("input", 7),
+            "module_path": "diffusion_model.blocks.7.attn",
+        }
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(reference_attention, q, k, v, 2, **kwargs)
+            override(reference_attention, q, k, v, 2, **kwargs)
+        records = self._json_log_records(logs.records)
+        snapshots = [record for record in records if record["record_type"] == "step_snapshot"]
+        self.assertEqual([record["eligible_call_index"] for record in snapshots], [0, 1])
+        self.assertEqual(snapshots[0]["block_id"], "input:7")
+        self.assertEqual(snapshots[0]["metadata"]["module_path"], "diffusion_model.blocks.7.attn")
+
+    def test_absent_block_metadata_logs_unknown(self):
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="summary", debug_format="jsonl"))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+        records = self._json_log_records(logs.records)
+        snapshot = [record for record in records if record["record_type"] == "step_snapshot"][0]
+        self.assertEqual(snapshot["block_id"], "unknown")
+        self.assertEqual(snapshot["metadata"], {})
+
+    def test_verbose_fallback_spam_is_throttled_and_summarized(self):
+        q_self = torch.randn(2, 2, 16, 4)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(
+            debug_level="verbose",
+            debug_format="jsonl",
+            max_verbose_fallbacks_per_step_per_reason=2,
+        ))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            for _ in range(5):
+                override(reference_attention, q_self, q_self, q_self, 2, **self._cfg_kwargs(1.0))
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+        records = self._json_log_records(logs.records)
+        fallback_records = [
+            record for record in records
+            if record["record_type"] == "fallback" and record["step_index"] == 0
+        ]
+        final_summary = [
+            record for record in records
+            if record["record_type"] == "step_final_summary" and record["step_index"] == 0
+        ][0]
+        self.assertEqual(len(fallback_records), 2)
+        self.assertEqual(final_summary["fallback_suppressed_reasons"], {"not_cross_attention": 3})
+
+    def test_debug_format_both_preserves_text_and_emits_valid_jsonl(self):
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="summary", debug_format="both"))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+        messages = [record.getMessage() for record in logs.records]
+        self.assertTrue(any("step_snapshot" in message and message.startswith("[AnimaAFM]") for message in messages))
+        json_records = self._json_log_records(logs.records)
+        self.assertTrue(any(record["record_type"] == "step_snapshot" for record in json_records))
 
     def test_self_attention_falls_back(self):
         torch.manual_seed(3)

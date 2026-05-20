@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+import json
 import logging
 import math
 from typing import Any, Callable
@@ -15,10 +16,20 @@ LOG_PREFIX = "[AnimaAFM]"
 SCHEDULES = ["curve", "lf_only", "hf_only", "constant"]
 BRANCH_MODES = ["both", "positive_only", "negative_only"]
 DEBUG_LEVELS = ["off", "summary", "verbose"]
+DEBUG_FORMATS = ["text", "jsonl", "both"]
 FAIL_MODES = ["fallback", "raise"]
 AFM_MODES = ["edit", "observe", "off"]
 ZERO_STRENGTH_MODES = ["original", "observe", "manual"]
 SPECTRAL_DIAG_MODES = ["off", "sampled", "full"]
+DIAGNOSTIC_BRANCHES = ["selected_mean", "positive", "negative", "both_separate"]
+SUMMARY_ONLY_FALLBACK_REASONS = ("not_cross_attention",)
+TRANSFORMER_METADATA_KEYS = (
+    "block",
+    "block_index",
+    "transformer_index",
+    "module_path",
+    "patches_replace",
+)
 
 
 @dataclass(frozen=True)
@@ -38,12 +49,16 @@ class AFMConfig:
     soft_mask: bool = True
     mask_width: float = 0.05
     debug_level: str = "off"
+    debug_format: str = "text"
     fail_mode: str = "fallback"
     max_logits_mib: float = 1024.0
     spectral_diag: str = "off"
+    diagnostic_branch: str = "both_separate"
     diagnostic_top_k: int = 8
     diagnostic_max_batches: int = 1
     diagnostic_max_heads: int = 4
+    max_verbose_fallbacks_per_step_per_reason: int = 3
+    fallback_summary_only_reasons: tuple[str, ...] = SUMMARY_ONLY_FALLBACK_REASONS
 
     def validate(self) -> None:
         if self.mode not in AFM_MODES:
@@ -56,10 +71,14 @@ class AFMConfig:
             raise ValueError(f"Unsupported AFM zero_strength_mode: {self.zero_strength_mode!r}")
         if self.debug_level not in DEBUG_LEVELS:
             raise ValueError(f"Unsupported AFM debug_level: {self.debug_level!r}")
+        if self.debug_format not in DEBUG_FORMATS:
+            raise ValueError(f"Unsupported AFM debug_format: {self.debug_format!r}")
         if self.fail_mode not in FAIL_MODES:
             raise ValueError(f"Unsupported AFM fail_mode: {self.fail_mode!r}")
         if self.spectral_diag not in SPECTRAL_DIAG_MODES:
             raise ValueError(f"Unsupported AFM spectral_diag: {self.spectral_diag!r}")
+        if self.diagnostic_branch not in DIAGNOSTIC_BRANCHES:
+            raise ValueError(f"Unsupported AFM diagnostic_branch: {self.diagnostic_branch!r}")
         if not 0.0 <= self.start_percent <= 1.0:
             raise ValueError("start_percent must be in [0, 1]")
         if not 0.0 <= self.end_percent <= 1.0:
@@ -78,6 +97,19 @@ class AFMConfig:
             raise ValueError("diagnostic_max_batches must be positive")
         if self.diagnostic_max_heads <= 0:
             raise ValueError("diagnostic_max_heads must be positive")
+        if self.max_verbose_fallbacks_per_step_per_reason < 0:
+            raise ValueError("max_verbose_fallbacks_per_step_per_reason must be non-negative")
+
+
+@dataclass(frozen=True)
+class SpectralDiagnostic:
+    branch: str
+    batch_indices: list[int]
+    rho_before: float
+    rho_after: float
+    delta_rho: float
+    attn_delta_mean: float
+    attn_delta_max: float
 
 
 @dataclass
@@ -101,6 +133,9 @@ class StepStats:
     rho_after: float | None = None
     delta_rho: float | None = None
     max_estimated_logits_mib: float = 0.0
+    eligible_call_metadata: dict[int, dict[str, Any]] = field(default_factory=dict)
+    spectral_diagnostics: dict[str, SpectralDiagnostic] = field(default_factory=dict)
+    fallback_suppressed_reasons: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass(frozen=True)
@@ -121,6 +156,9 @@ class AFMRuntimeStats:
     steps: dict[int, StepStats] = field(default_factory=dict)
     summaries_by_step: set[int] = field(default_factory=set)
     verbose_counts_by_step: dict[int, int] = field(default_factory=dict)
+    finalized_steps: set[int] = field(default_factory=set)
+    active_step_index: int | None = None
+    verbose_fallback_counts_by_step_reason: dict[tuple[int, str], int] = field(default_factory=dict)
 
     def step_for(self, progress: "ProgressInfo") -> StepStats:
         stats = self.steps.get(progress.index)
@@ -240,6 +278,81 @@ def selected_branch_indices(batch: int, cond_or_uncond: list[int] | None, branch
             continue
         selected.extend(range(chunk_index * per_chunk, (chunk_index + 1) * per_chunk))
     return torch.tensor(selected, dtype=torch.long, device=device)
+
+
+def _branch_indices(batch: int, cond_or_uncond: list[int] | None, branch_name: str) -> list[int]:
+    if not cond_or_uncond:
+        return []
+    branch_value = 0 if branch_name == "positive" else 1
+    chunks = len(cond_or_uncond)
+    if chunks <= 0 or batch % chunks != 0:
+        return []
+    per_chunk = batch // chunks
+    indices: list[int] = []
+    for chunk_index, branch in enumerate(cond_or_uncond):
+        if branch != branch_value:
+            continue
+        indices.extend(range(chunk_index * per_chunk, (chunk_index + 1) * per_chunk))
+    return indices
+
+
+def diagnostic_batch_positions(
+    selected: torch.Tensor,
+    batch: int,
+    cond_or_uncond: list[int] | None,
+    diagnostic_branch: str,
+) -> list[tuple[str, list[int], list[int]]]:
+    selected_indices = [int(i) for i in selected.detach().cpu().tolist()]
+    selected_position_by_batch = {batch_index: pos for pos, batch_index in enumerate(selected_indices)}
+    if diagnostic_branch == "selected_mean":
+        return [("selected_mean", list(range(len(selected_indices))), selected_indices)]
+
+    requested = ["negative", "positive"] if diagnostic_branch == "both_separate" else [diagnostic_branch]
+    positions: list[tuple[str, list[int], list[int]]] = []
+    for branch in requested:
+        batch_indices = _branch_indices(batch, cond_or_uncond, branch)
+        selected_batch_indices = [idx for idx in batch_indices if idx in selected_position_by_batch]
+        if selected_batch_indices:
+            positions.append((branch, [selected_position_by_batch[idx] for idx in selected_batch_indices], selected_batch_indices))
+    if not positions and diagnostic_branch == "both_separate":
+        return [("selected_mean", list(range(len(selected_indices))), selected_indices)]
+    return positions
+
+
+def _safe_metadata_value(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if torch.is_tensor(value):
+        return {"tensor_shape": list(value.shape), "dtype": str(value.dtype), "device": str(value.device)}
+    if isinstance(value, tuple | list):
+        if all(item is None or isinstance(item, str | int | float | bool) for item in value):
+            return list(value)
+        return {"type": type(value).__name__, "len": len(value)}
+    if isinstance(value, dict):
+        return {"type": "dict", "count": len(value), "keys": [str(key) for key in list(value.keys())[:16]]}
+    return str(value)
+
+
+def discover_transformer_metadata(transformer_options: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    metadata = {
+        key: _safe_metadata_value(transformer_options[key])
+        for key in TRANSFORMER_METADATA_KEYS
+        if key in transformer_options
+    }
+    block = metadata.get("block")
+    if isinstance(block, list) and block:
+        block_id = ":".join(str(part) for part in block)
+    elif "block_index" in metadata:
+        block_id = str(metadata["block_index"])
+    elif "transformer_index" in metadata:
+        block_id = str(metadata["transformer_index"])
+    else:
+        block_id = "unknown"
+    return block_id, metadata
+
+
+def _counter_dict(counter: Counter[str]) -> dict[str, int]:
+    return {key: int(value) for key, value in counter.items()}
 
 
 def estimate_logits_mib(batch: int, heads: int, query_len: int, text_len: int, bytes_per: int = 4) -> float:
@@ -386,26 +499,47 @@ def sampled_spectral_diagnostics(
     after: torch.Tensor,
     spatial_shape: tuple[int, int],
     config: AFMConfig,
-) -> tuple[float, float, float, float, float]:
-    if config.spectral_diag == "sampled":
-        batch = min(int(before.shape[0]), config.diagnostic_max_batches)
-        heads = min(int(before.shape[1]), config.diagnostic_max_heads)
-        before = before[:batch, :heads]
-        after = after[:batch, :heads]
-    conc_before = topk_concentration_map_from_logits(before, config.diagnostic_top_k)
-    conc_after = topk_concentration_map_from_logits(after, config.diagnostic_top_k)
-    rho_before = hf_ratio_from_concentration(conc_before, spatial_shape, config.cutoff)
-    rho_after = hf_ratio_from_concentration(conc_after, spatial_shape, config.cutoff)
-    probs_before = torch.softmax(before.float(), dim=-1)
-    probs_after = torch.softmax(after.float(), dim=-1)
-    attn_delta = (probs_after - probs_before).abs()
-    return (
-        rho_before,
-        rho_after,
-        rho_after - rho_before,
-        float(attn_delta.mean().detach().cpu().item()),
-        float(attn_delta.max().detach().cpu().item()),
-    )
+    selected: torch.Tensor,
+    full_batch: int,
+    cond_or_uncond: list[int] | None,
+) -> list[SpectralDiagnostic]:
+    diagnostics: list[SpectralDiagnostic] = []
+    for branch, positions, batch_indices in diagnostic_batch_positions(
+        selected,
+        full_batch,
+        cond_or_uncond,
+        config.diagnostic_branch,
+    ):
+        if not positions:
+            continue
+        if config.spectral_diag == "sampled":
+            positions = positions[: config.diagnostic_max_batches]
+            batch_indices = batch_indices[: config.diagnostic_max_batches]
+        index = torch.tensor(positions, dtype=torch.long, device=before.device)
+        before_branch = before.index_select(0, index)
+        after_branch = after.index_select(0, index)
+        if config.spectral_diag == "sampled":
+            heads = min(int(before_branch.shape[1]), config.diagnostic_max_heads)
+            before_branch = before_branch[:, :heads]
+            after_branch = after_branch[:, :heads]
+        with torch.no_grad():
+            conc_before = topk_concentration_map_from_logits(before_branch, config.diagnostic_top_k)
+            conc_after = topk_concentration_map_from_logits(after_branch, config.diagnostic_top_k)
+            rho_before = hf_ratio_from_concentration(conc_before, spatial_shape, config.cutoff)
+            rho_after = hf_ratio_from_concentration(conc_after, spatial_shape, config.cutoff)
+            probs_before = torch.softmax(before_branch.float(), dim=-1)
+            probs_after = torch.softmax(after_branch.float(), dim=-1)
+            attn_delta = (probs_after - probs_before).abs()
+            diagnostics.append(SpectralDiagnostic(
+                branch=branch,
+                batch_indices=batch_indices,
+                rho_before=rho_before,
+                rho_after=rho_after,
+                delta_rho=rho_after - rho_before,
+                attn_delta_mean=float(attn_delta.mean().detach().cpu().item()),
+                attn_delta_max=float(attn_delta.max().detach().cpu().item()),
+            ))
+    return diagnostics
 
 
 class AnimaAFMAttentionOverride:
@@ -413,6 +547,58 @@ class AnimaAFMAttentionOverride:
         config.validate()
         self.config = config
         self.stats = AFMRuntimeStats()
+        self.run_id = f"afm-{id(self):x}"
+
+    def finalize(self) -> None:
+        if self.stats.active_step_index is not None:
+            self._finalize_step(self.stats.active_step_index)
+
+    def _step_for(self, progress: ProgressInfo) -> StepStats:
+        active = self.stats.active_step_index
+        if active is not None and active != progress.index:
+            self._finalize_step(active)
+        self.stats.active_step_index = progress.index
+        return self.stats.step_for(progress)
+
+    def _finalize_step(self, step_index: int) -> None:
+        if step_index in self.stats.finalized_steps:
+            return
+        step = self.stats.steps.get(step_index)
+        if step is None:
+            return
+        progress = ProgressInfo(
+            index=step.index,
+            num_steps=step.num_steps,
+            last_index=step.last_index,
+            progress=step.progress,
+            sigma=step.sigma,
+        )
+        if self.config.debug_level != "off":
+            self._log_step_summary(step, "step_final_summary", progress, "step_change")
+        self.stats.finalized_steps.add(step_index)
+
+    def _emit_text(self, message: str, *args: Any) -> None:
+        if self.config.debug_format in ("text", "both"):
+            LOGGER.info(message, *args)
+
+    def _emit_jsonl(self, record: dict[str, Any]) -> None:
+        if self.config.debug_format in ("jsonl", "both"):
+            LOGGER.info(json.dumps(record, sort_keys=True, separators=(",", ":")))
+
+    def _record_base(self, record_type: str, progress: ProgressInfo | None) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "record_type": record_type,
+            "run_id": self.run_id,
+        }
+        if progress is not None:
+            record.update({
+                "step_index": progress.index,
+                "num_steps": progress.num_steps,
+                "last_index": progress.last_index,
+                "u": progress.progress,
+                "sigma": progress.sigma,
+            })
+        return record
 
     def __call__(self, original_func: Callable, *args: Any, **kwargs: Any) -> torch.Tensor:
         try:
@@ -421,7 +607,10 @@ class AnimaAFMAttentionOverride:
             if self.config.fail_mode == "raise":
                 LOGGER.exception("%s attention override failed", LOG_PREFIX)
                 raise
-            self.stats.record_fallback("oom_or_runtime_error", self._progress_from_kwargs(kwargs))
+            progress = self._progress_from_kwargs(kwargs)
+            if progress is not None:
+                self._step_for(progress)
+            self.stats.record_fallback("oom_or_runtime_error", progress)
             LOGGER.warning("%s falling back after %s: %s", LOG_PREFIX, type(exc).__name__, exc)
             return original_func(*args, **kwargs)
 
@@ -442,7 +631,7 @@ class AnimaAFMAttentionOverride:
         transformer_options = kwargs.get("transformer_options") or {}
         progress = progress_from_sigmas(transformer_options)
         if progress is not None:
-            self.stats.step_for(progress).total_calls += 1
+            self._step_for(progress).total_calls += 1
 
         if len(args) > 4 and args[4] is not None:
             return self._fallback(original_func, "mask_shape_unsupported", *args, progress=progress, **kwargs)
@@ -479,10 +668,13 @@ class AnimaAFMAttentionOverride:
             if self.config.zero_strength_mode == "observe":
                 active_mode = "observe"
 
-        step = self.stats.step_for(progress)
+        step = self._step_for(progress)
+        eligible_call_index = step.eligible_calls
+        block_id, metadata = discover_transformer_metadata(transformer_options)
         step.eligible_calls += 1
         step.shape_counts[shape_key(q, k)] += 1
         step.selected_counts[f"{int(selected.numel())}/{batch}"] += 1
+        step.eligible_call_metadata[eligible_call_index] = {"block_id": block_id, **metadata}
 
         if active_mode == "observe":
             self.stats.observed_calls += 1
@@ -505,7 +697,10 @@ class AnimaAFMAttentionOverride:
                 gqa_info=None,
                 estimated_logits_mib=estimated,
                 logits_delta=None,
-                attn_delta=None,
+                diagnostics=[],
+                eligible_call_index=eligible_call_index,
+                block_id=block_id,
+                metadata=metadata,
             )
             return out
 
@@ -553,13 +748,23 @@ class AnimaAFMAttentionOverride:
         step.edited_calls += 1
         logits_delta = float((edited_logits - logits).abs().max().detach().cpu().item())
         step.max_logit_delta = max(step.max_logit_delta, logits_delta)
-        attn_delta: tuple[float, float, float, float, float] | None = None
+        diagnostics: list[SpectralDiagnostic] = []
         if self.config.spectral_diag != "off":
-            attn_delta = sampled_spectral_diagnostics(logits, edited_logits, spatial_shape, self.config)
-            step.rho_before = attn_delta[0]
-            step.rho_after = attn_delta[1]
-            step.delta_rho = attn_delta[2]
-            step.max_attn_delta = max(step.max_attn_delta or 0.0, attn_delta[4])
+            diagnostics = sampled_spectral_diagnostics(
+                logits,
+                edited_logits,
+                spatial_shape,
+                self.config,
+                selected,
+                batch,
+                cond_or_uncond,
+            )
+            for diagnostic in diagnostics:
+                step.spectral_diagnostics[diagnostic.branch] = diagnostic
+                step.rho_before = diagnostic.rho_before
+                step.rho_after = diagnostic.rho_after
+                step.delta_rho = diagnostic.delta_rho
+                step.max_attn_delta = max(step.max_attn_delta or 0.0, diagnostic.attn_delta_max)
         self._log_eligible(
             mode="edit",
             progress=progress,
@@ -575,7 +780,10 @@ class AnimaAFMAttentionOverride:
             gqa_info=gqa_info,
             estimated_logits_mib=estimated,
             logits_delta=logits_delta,
-            attn_delta=attn_delta,
+            diagnostics=diagnostics,
+            eligible_call_index=eligible_call_index,
+            block_id=block_id,
+            metadata=metadata,
         )
         return out
 
@@ -584,14 +792,61 @@ class AnimaAFMAttentionOverride:
         return progress_from_sigmas(transformer_options)
 
     def _fallback(self, original_func: Callable, reason: str, *args: Any, progress: ProgressInfo | None = None, **kwargs: Any) -> torch.Tensor:
+        if progress is not None:
+            self._step_for(progress)
         self.stats.record_fallback(reason, progress)
-        if self.config.debug_level == "verbose":
+        if self.config.debug_level == "verbose" and self._should_log_verbose_fallback(reason, progress):
             q, k, v = (args + (None, None, None))[:3]
             shapes = ""
+            q_shape = k_shape = v_shape = None
             if torch.is_tensor(q) and torch.is_tensor(k) and torch.is_tensor(v):
                 shapes = f" q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
-            LOGGER.info("%s fallback reason=%s%s", LOG_PREFIX, reason, shapes)
+                q_shape = list(q.shape)
+                k_shape = list(k.shape)
+                v_shape = list(v.shape)
+            self._emit_text("%s fallback reason=%s%s", LOG_PREFIX, reason, shapes)
+            transformer_options = kwargs.get("transformer_options") or {}
+            spatial_shape = None
+            if torch.is_tensor(q):
+                spatial = infer_square_spatial_shape(int(q.shape[-2]))
+                spatial_shape = None if spatial is None else list(spatial)
+            record = self._record_base("fallback", progress)
+            record.update({
+                "reason": reason,
+                "eligible_call_index": None,
+                "q_shape": q_shape,
+                "k_shape": k_shape,
+                "v_shape": v_shape,
+                "spatial_shape": spatial_shape,
+                "cond_or_uncond": transformer_options.get("cond_or_uncond"),
+                "branch_mode": self.config.branch_mode,
+                "selected_indices": [],
+                "diagnostic_branch": self.config.diagnostic_branch,
+                "alpha_lf": None,
+                "alpha_hf": None,
+                "rho_before": None,
+                "rho_after": None,
+                "delta_rho": None,
+                "estimated_logits_mib": None,
+                "estimated_peak_mib": None,
+            })
+            self._emit_jsonl(record)
         return original_func(*args, **kwargs)
+
+    def _should_log_verbose_fallback(self, reason: str, progress: ProgressInfo | None) -> bool:
+        if progress is None:
+            return True
+        summary_only_reasons = set(self.config.fallback_summary_only_reasons)
+        if reason not in summary_only_reasons:
+            return True
+        key = (progress.index, reason)
+        count = self.stats.verbose_fallback_counts_by_step_reason.get(key, 0)
+        self.stats.verbose_fallback_counts_by_step_reason[key] = count + 1
+        if count < self.config.max_verbose_fallbacks_per_step_per_reason:
+            return True
+        step = self.stats.step_for(progress)
+        step.fallback_suppressed_reasons[reason] += 1
+        return False
 
     def _log_eligible(
         self,
@@ -609,7 +864,10 @@ class AnimaAFMAttentionOverride:
         gqa_info: GQAInfo | None,
         estimated_logits_mib: float,
         logits_delta: float | None,
-        attn_delta: tuple[float, float, float, float, float] | None,
+        diagnostics: list[SpectralDiagnostic],
+        eligible_call_index: int,
+        block_id: str,
+        metadata: dict[str, Any],
     ) -> None:
         if self.config.debug_level == "off":
             return
@@ -620,24 +878,97 @@ class AnimaAFMAttentionOverride:
             return
 
         step = self.stats.step_for(progress)
+        self._log_step_summary(
+            step=step,
+            record_type="step_snapshot",
+            progress=progress,
+            snapshot_reason="eligible_call",
+            mode=mode,
+            q=q,
+            k=k,
+            v=v,
+            spatial_shape=spatial_shape,
+            alpha_lf=alpha_lf,
+            alpha_hf=alpha_hf,
+            entropy_value=entropy_value,
+            selected=selected,
+            cond_or_uncond=cond_or_uncond,
+            gqa_info=gqa_info,
+            estimated_logits_mib=estimated_logits_mib,
+            logits_delta=logits_delta,
+            eligible_call_index=eligible_call_index,
+            block_id=block_id,
+            metadata=metadata,
+        )
+        for diagnostic in diagnostics:
+            self._log_spectral_diag(
+                progress=progress,
+                diagnostic=diagnostic,
+                eligible_call_index=eligible_call_index,
+                q=q,
+                k=k,
+                v=v,
+                spatial_shape=spatial_shape,
+                selected=selected,
+                cond_or_uncond=cond_or_uncond,
+                alpha_lf=alpha_lf,
+                alpha_hf=alpha_hf,
+                estimated_logits_mib=estimated_logits_mib,
+            )
+        if self.config.debug_level == "verbose":
+            self.stats.verbose_counts_by_step[progress.index] = verbose_count + 1
+        self.stats.summaries_by_step.add(progress.index)
+
+    def _log_step_summary(
+        self,
+        step: StepStats,
+        record_type: str,
+        progress: ProgressInfo | None,
+        snapshot_reason: str,
+        mode: str | None = None,
+        q: torch.Tensor | None = None,
+        k: torch.Tensor | None = None,
+        v: torch.Tensor | None = None,
+        spatial_shape: tuple[int, int] | None = None,
+        alpha_lf: float | None = None,
+        alpha_hf: float | None = None,
+        entropy_value: float | None = None,
+        selected: torch.Tensor | None = None,
+        cond_or_uncond: list[int] | None = None,
+        gqa_info: GQAInfo | None = None,
+        estimated_logits_mib: float | None = None,
+        logits_delta: float | None = None,
+        eligible_call_index: int | None = None,
+        block_id: str = "unknown",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         fallback_summary = "{" + ", ".join(f"{key}:{value}" for key, value in step.fallback_reasons.items()) + "}"
         shape_summary = "{" + ", ".join(f"{key}:{value}" for key, value in step.shape_counts.items()) + "}"
-        selected_indices = [int(i) for i in selected.detach().cpu().tolist()]
+        suppressed_summary = "{" + ", ".join(f"{key}:{value}" for key, value in step.fallback_suppressed_reasons.items()) + "}"
+        selected_indices = [] if selected is None else [int(i) for i in selected.detach().cpu().tolist()]
+        q_shape = None if q is None else tuple(q.shape)
+        k_shape = None if k is None else tuple(k.shape)
+        v_shape = None if v is None else tuple(v.shape)
         message = (
-            "%s step_summary step_index=%s num_steps=%s last_index=%s u=%.4f sigma=%.6g "
-            "mode=%s calls=%s eligible=%s edited=%s observed=%s fallbacks=%s fallback_reasons=%s "
-            "q=%s k=%s v=%s spatial=%s shapes=%s cond_or_uncond=%s branch_mode=%s "
-            "selected_indices=%s selected_count=%s batch=%s strength=%.4f cutoff=%.4f "
-            "alpha_lf=%s alpha_hf=%s entropy=%s gqa=%s estimated_logits_mib=%.1f max_logit_delta=%s"
+            "%s %s step_index=%s num_steps=%s last_index=%s u=%.4f sigma=%.6g "
+            "snapshot_reason=%s snapshot_call_index=%s mode=%s calls=%s eligible=%s edited=%s observed=%s "
+            "fallbacks=%s fallback_reasons=%s fallback_suppressed_reasons=%s "
+            "eligible_call_index=%s block_id=%s metadata=%s q=%s k=%s v=%s spatial=%s shapes=%s "
+            "cond_or_uncond=%s branch_mode=%s selected_indices=%s selected_count=%s batch=%s "
+            "strength=%.4f cutoff=%.4f alpha_lf=%s alpha_hf=%s entropy=%s gqa=%s "
+            "estimated_logits_mib=%s max_estimated_logits_mib=%.1f max_logit_delta=%s"
         )
-        LOGGER.info(
+        self._emit_text(
             message,
             LOG_PREFIX,
+            record_type,
             progress.index,
             progress.num_steps,
             progress.last_index,
             progress.progress,
             progress.sigma,
+            snapshot_reason,
+            eligible_call_index,
             mode,
             step.total_calls,
             step.eligible_calls,
@@ -645,16 +976,20 @@ class AnimaAFMAttentionOverride:
             step.observed_calls,
             step.fallback_calls,
             fallback_summary,
-            tuple(q.shape),
-            tuple(k.shape),
-            tuple(v.shape),
+            suppressed_summary,
+            eligible_call_index,
+            block_id,
+            metadata or {},
+            q_shape,
+            k_shape,
+            v_shape,
             spatial_shape,
             shape_summary,
             cond_or_uncond,
             self.config.branch_mode,
             selected_indices,
             len(selected_indices),
-            int(q.shape[0]),
+            "n/a" if q is None else int(q.shape[0]),
             self.config.strength,
             self.config.cutoff,
             "n/a" if alpha_lf is None else f"{alpha_lf:.4f}",
@@ -665,23 +1000,110 @@ class AnimaAFMAttentionOverride:
                 f"q_heads={gqa_info.q_heads},kv_heads_before={gqa_info.kv_heads_before},"
                 f"kv_heads_after={gqa_info.kv_heads_after}"
             ),
-            estimated_logits_mib,
+            "n/a" if estimated_logits_mib is None else f"{estimated_logits_mib:.1f}",
+            step.max_estimated_logits_mib,
             "n/a" if logits_delta is None else f"{logits_delta:.6g}",
         )
-        if attn_delta is not None:
-            LOGGER.info(
-                "%s spectral_diag step_index=%s rho_before=%.6g rho_after=%.6g delta_rho=%.6g attn_delta_mean=%.6g attn_delta_max=%.6g",
-                LOG_PREFIX,
-                progress.index,
-                attn_delta[0],
-                attn_delta[1],
-                attn_delta[2],
-                attn_delta[3],
-                attn_delta[4],
-            )
-        if self.config.debug_level == "verbose":
-            self.stats.verbose_counts_by_step[progress.index] = verbose_count + 1
-        self.stats.summaries_by_step.add(progress.index)
+        record = self._record_base(record_type, progress)
+        record.update({
+            "snapshot_reason": snapshot_reason,
+            "snapshot_call_index": eligible_call_index,
+            "mode": mode,
+            "calls": step.total_calls,
+            "eligible": step.eligible_calls,
+            "edited": step.edited_calls,
+            "observed": step.observed_calls,
+            "fallbacks": step.fallback_calls,
+            "fallback_reasons": _counter_dict(step.fallback_reasons),
+            "fallback_suppressed_reasons": _counter_dict(step.fallback_suppressed_reasons),
+            "eligible_call_index": eligible_call_index,
+            "block_id": block_id,
+            "metadata": metadata or {},
+            "q_shape": None if q is None else list(q.shape),
+            "k_shape": None if k is None else list(k.shape),
+            "v_shape": None if v is None else list(v.shape),
+            "spatial_shape": None if spatial_shape is None else list(spatial_shape),
+            "shape_counts": _counter_dict(step.shape_counts),
+            "cond_or_uncond": cond_or_uncond,
+            "branch_mode": self.config.branch_mode,
+            "selected_indices": selected_indices,
+            "selected_count": len(selected_indices),
+            "diagnostic_branch": self.config.diagnostic_branch,
+            "batch": None if q is None else int(q.shape[0]),
+            "strength": float(self.config.strength),
+            "cutoff": float(self.config.cutoff),
+            "alpha_lf": alpha_lf,
+            "alpha_hf": alpha_hf,
+            "rho_before": step.rho_before,
+            "rho_after": step.rho_after,
+            "delta_rho": step.delta_rho,
+            "entropy": entropy_value,
+            "gqa": None if gqa_info is None else {
+                "enabled": gqa_info.enabled,
+                "repeats": gqa_info.repeats,
+                "q_heads": gqa_info.q_heads,
+                "kv_heads_before": gqa_info.kv_heads_before,
+                "kv_heads_after": gqa_info.kv_heads_after,
+            },
+            "estimated_logits_mib": estimated_logits_mib,
+            "estimated_peak_mib": None,
+            "max_estimated_logits_mib": step.max_estimated_logits_mib,
+            "max_logit_delta": logits_delta,
+        })
+        self._emit_jsonl(record)
+
+    def _log_spectral_diag(
+        self,
+        progress: ProgressInfo,
+        diagnostic: SpectralDiagnostic,
+        eligible_call_index: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        spatial_shape: tuple[int, int],
+        selected: torch.Tensor,
+        cond_or_uncond: list[int] | None,
+        alpha_lf: float | None,
+        alpha_hf: float | None,
+        estimated_logits_mib: float,
+    ) -> None:
+        self._emit_text(
+            "%s spectral_diag step_index=%s eligible_call_index=%s branch=%s rho_before=%.6g "
+            "rho_after=%.6g delta_rho=%.6g attn_delta_mean=%.6g attn_delta_max=%.6g batch_indices=%s",
+            LOG_PREFIX,
+            progress.index,
+            eligible_call_index,
+            diagnostic.branch,
+            diagnostic.rho_before,
+            diagnostic.rho_after,
+            diagnostic.delta_rho,
+            diagnostic.attn_delta_mean,
+            diagnostic.attn_delta_max,
+            diagnostic.batch_indices,
+        )
+        record = self._record_base("spectral_diag", progress)
+        record.update({
+            "eligible_call_index": eligible_call_index,
+            "q_shape": list(q.shape),
+            "k_shape": list(k.shape),
+            "v_shape": list(v.shape),
+            "spatial_shape": list(spatial_shape),
+            "cond_or_uncond": cond_or_uncond,
+            "branch_mode": self.config.branch_mode,
+            "selected_indices": [int(i) for i in selected.detach().cpu().tolist()],
+            "diagnostic_branch": diagnostic.branch,
+            "batch_indices": diagnostic.batch_indices,
+            "alpha_lf": alpha_lf,
+            "alpha_hf": alpha_hf,
+            "rho_before": diagnostic.rho_before,
+            "rho_after": diagnostic.rho_after,
+            "delta_rho": diagnostic.delta_rho,
+            "attn_delta_mean": diagnostic.attn_delta_mean,
+            "attn_delta_max": diagnostic.attn_delta_max,
+            "estimated_logits_mib": estimated_logits_mib,
+            "estimated_peak_mib": None,
+        })
+        self._emit_jsonl(record)
 
 
 def is_anima_like_model(model: Any) -> bool:
