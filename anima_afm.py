@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import math
+from pathlib import Path
 from typing import Any, Callable
 
 import torch
@@ -50,9 +51,12 @@ class AFMConfig:
     mask_width: float = 0.05
     debug_level: str = "off"
     debug_format: str = "text"
+    jsonl_path: str | None = None
     fail_mode: str = "fallback"
     max_logits_mib: float = 1024.0
     spectral_diag: str = "off"
+    diagnostic_call_indices: str = "0"
+    diagnostic_every_n_steps: int = 1
     diagnostic_branch: str = "both_separate"
     diagnostic_top_k: int = 8
     diagnostic_max_batches: int = 1
@@ -79,6 +83,7 @@ class AFMConfig:
             raise ValueError(f"Unsupported AFM spectral_diag: {self.spectral_diag!r}")
         if self.diagnostic_branch not in DIAGNOSTIC_BRANCHES:
             raise ValueError(f"Unsupported AFM diagnostic_branch: {self.diagnostic_branch!r}")
+        parse_call_index_scope(self.diagnostic_call_indices)
         if not 0.0 <= self.start_percent <= 1.0:
             raise ValueError("start_percent must be in [0, 1]")
         if not 0.0 <= self.end_percent <= 1.0:
@@ -97,6 +102,8 @@ class AFMConfig:
             raise ValueError("diagnostic_max_batches must be positive")
         if self.diagnostic_max_heads <= 0:
             raise ValueError("diagnostic_max_heads must be positive")
+        if self.diagnostic_every_n_steps <= 0:
+            raise ValueError("diagnostic_every_n_steps must be positive")
         if self.max_verbose_fallbacks_per_step_per_reason < 0:
             raise ValueError("max_verbose_fallbacks_per_step_per_reason must be non-negative")
 
@@ -126,6 +133,7 @@ class StepStats:
     fallback_calls: int = 0
     fallback_reasons: Counter[str] = field(default_factory=Counter)
     shape_counts: Counter[str] = field(default_factory=Counter)
+    eligible_call_indices: Counter[int] = field(default_factory=Counter)
     selected_counts: Counter[str] = field(default_factory=Counter)
     max_logit_delta: float = 0.0
     max_attn_delta: float | None = None
@@ -158,6 +166,8 @@ class AFMRuntimeStats:
     verbose_counts_by_step: dict[int, int] = field(default_factory=dict)
     finalized_steps: set[int] = field(default_factory=set)
     active_step_index: int | None = None
+    expected_total_calls_per_step: int | None = None
+    run_final_summary_emitted: bool = False
     verbose_fallback_counts_by_step_reason: dict[tuple[int, str], int] = field(default_factory=dict)
 
     def step_for(self, progress: "ProgressInfo") -> StepStats:
@@ -355,6 +365,32 @@ def _counter_dict(counter: Counter[str]) -> dict[str, int]:
     return {key: int(value) for key, value in counter.items()}
 
 
+def _counter_key_dict(counter: Counter[Any]) -> dict[str, int]:
+    return {str(key): int(value) for key, value in sorted(counter.items(), key=lambda item: item[0])}
+
+
+def parse_call_index_scope(spec: str) -> set[int] | None:
+    normalized = str(spec).strip().lower()
+    if normalized == "all":
+        return None
+    if not normalized:
+        raise ValueError("diagnostic_call_indices must be 'all' or a comma-separated list of non-negative integers")
+
+    indices: set[int] = set()
+    for raw_part in normalized.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError(f"Invalid diagnostic_call_indices entry in {spec!r}")
+        try:
+            index = int(part)
+        except ValueError as exc:
+            raise ValueError(f"Invalid diagnostic_call_indices entry: {part!r}") from exc
+        if index < 0:
+            raise ValueError("diagnostic_call_indices entries must be non-negative")
+        indices.add(index)
+    return indices
+
+
 def estimate_logits_mib(batch: int, heads: int, query_len: int, text_len: int, bytes_per: int = 4) -> float:
     return batch * heads * query_len * text_len * bytes_per / (1024**2)
 
@@ -548,19 +584,21 @@ class AnimaAFMAttentionOverride:
         self.config = config
         self.stats = AFMRuntimeStats()
         self.run_id = f"afm-{id(self):x}"
+        self._diagnostic_call_indices = parse_call_index_scope(config.diagnostic_call_indices)
 
     def finalize(self) -> None:
         if self.stats.active_step_index is not None:
-            self._finalize_step(self.stats.active_step_index)
+            self._finalize_step(self.stats.active_step_index, "finalize_called")
+        self._log_run_final_summary()
 
     def _step_for(self, progress: ProgressInfo) -> StepStats:
         active = self.stats.active_step_index
         if active is not None and active != progress.index:
-            self._finalize_step(active)
+            self._finalize_step(active, "step_change")
         self.stats.active_step_index = progress.index
         return self.stats.step_for(progress)
 
-    def _finalize_step(self, step_index: int) -> None:
+    def _finalize_step(self, step_index: int, final_reason: str) -> None:
         if step_index in self.stats.finalized_steps:
             return
         step = self.stats.steps.get(step_index)
@@ -574,8 +612,21 @@ class AnimaAFMAttentionOverride:
             sigma=step.sigma,
         )
         if self.config.debug_level != "off":
-            self._log_step_summary(step, "step_final_summary", progress, "step_change")
+            self._log_step_summary(step, "step_final_summary", progress, final_reason, final_reason=final_reason)
         self.stats.finalized_steps.add(step_index)
+        if step.total_calls > 0 and step_index != step.last_index and self.stats.expected_total_calls_per_step is None:
+            self.stats.expected_total_calls_per_step = step.total_calls
+
+    def _maybe_finalize_current_step(self, progress: ProgressInfo | None) -> None:
+        if progress is None or progress.index != progress.last_index:
+            return
+        expected = self.stats.expected_total_calls_per_step
+        if expected is None:
+            return
+        step = self.stats.steps.get(progress.index)
+        if step is None or step.total_calls < expected:
+            return
+        self._finalize_step(progress.index, "expected_call_count_reached")
 
     def _emit_text(self, message: str, *args: Any) -> None:
         if self.config.debug_format in ("text", "both"):
@@ -583,7 +634,14 @@ class AnimaAFMAttentionOverride:
 
     def _emit_jsonl(self, record: dict[str, Any]) -> None:
         if self.config.debug_format in ("jsonl", "both"):
-            LOGGER.info(json.dumps(record, sort_keys=True, separators=(",", ":")))
+            line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+            LOGGER.info(line)
+            if self.config.jsonl_path:
+                path = Path(self.config.jsonl_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+                    handle.write("\n")
 
     def _record_base(self, record_type: str, progress: ProgressInfo | None) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -600,19 +658,70 @@ class AnimaAFMAttentionOverride:
             })
         return record
 
+    def _step_totals_record(self, step: StepStats) -> dict[str, Any]:
+        return {
+            "calls": step.total_calls,
+            "eligible": step.eligible_calls,
+            "edited": step.edited_calls,
+            "observed": step.observed_calls,
+            "fallbacks": step.fallback_calls,
+            "fallback_reasons": _counter_dict(step.fallback_reasons),
+            "fallback_suppressed_reasons": _counter_dict(step.fallback_suppressed_reasons),
+            "eligible_call_indices": _counter_key_dict(step.eligible_call_indices),
+            "shape_counts": _counter_dict(step.shape_counts),
+            "max_estimated_logits_mib": step.max_estimated_logits_mib,
+            "max_logit_delta": step.max_logit_delta,
+            "rho_before": step.rho_before,
+            "rho_after": step.rho_after,
+            "delta_rho": step.delta_rho,
+        }
+
+    def _log_run_final_summary(self) -> None:
+        if self.stats.run_final_summary_emitted or self.config.debug_level == "off":
+            return
+        if not self.stats.steps:
+            return
+        last_step_index = max(self.stats.steps)
+        record = self._record_base("run_final_summary", None)
+        record.update({
+            "last_step_index": last_step_index,
+            "expected_total_calls_per_step": self.stats.expected_total_calls_per_step,
+            "edited": self.stats.edited_calls,
+            "observed": self.stats.observed_calls,
+            "fallbacks": self.stats.fallback_calls,
+            "fallback_reasons": dict(self.stats.fallback_reasons),
+            "steps": {
+                str(step_index): self._step_totals_record(step)
+                for step_index, step in sorted(self.stats.steps.items())
+            },
+        })
+        self._emit_text(
+            "%s run_final_summary last_step_index=%s expected_total_calls_per_step=%s edited=%s observed=%s fallbacks=%s",
+            LOG_PREFIX,
+            last_step_index,
+            self.stats.expected_total_calls_per_step,
+            self.stats.edited_calls,
+            self.stats.observed_calls,
+            self.stats.fallback_calls,
+        )
+        self._emit_jsonl(record)
+        self.stats.run_final_summary_emitted = True
+
     def __call__(self, original_func: Callable, *args: Any, **kwargs: Any) -> torch.Tensor:
+        progress = self._progress_from_kwargs(kwargs)
         try:
-            return self._call(original_func, *args, **kwargs)
+            result = self._call(original_func, *args, **kwargs)
         except Exception as exc:
             if self.config.fail_mode == "raise":
                 LOGGER.exception("%s attention override failed", LOG_PREFIX)
                 raise
-            progress = self._progress_from_kwargs(kwargs)
             if progress is not None:
                 self._step_for(progress)
             self.stats.record_fallback("oom_or_runtime_error", progress)
             LOGGER.warning("%s falling back after %s: %s", LOG_PREFIX, type(exc).__name__, exc)
-            return original_func(*args, **kwargs)
+            result = original_func(*args, **kwargs)
+        self._maybe_finalize_current_step(progress)
+        return result
 
     def _call(self, original_func: Callable, *args: Any, **kwargs: Any) -> torch.Tensor:
         if self.config.mode == "off":
@@ -672,6 +781,7 @@ class AnimaAFMAttentionOverride:
         eligible_call_index = step.eligible_calls
         block_id, metadata = discover_transformer_metadata(transformer_options)
         step.eligible_calls += 1
+        step.eligible_call_indices[eligible_call_index] += 1
         step.shape_counts[shape_key(q, k)] += 1
         step.selected_counts[f"{int(selected.numel())}/{batch}"] += 1
         step.eligible_call_metadata[eligible_call_index] = {"block_id": block_id, **metadata}
@@ -681,6 +791,32 @@ class AnimaAFMAttentionOverride:
             step.observed_calls += 1
             estimated = estimate_logits_mib(int(selected.numel()), int(q.shape[1]), query_len, text_len)
             step.max_estimated_logits_mib = max(step.max_estimated_logits_mib, estimated)
+            diagnostics: list[SpectralDiagnostic] = []
+            if self._should_run_spectral_diag(progress, eligible_call_index):
+                scale = kwargs.get("scale", q.shape[-1] ** -0.5)
+                q_diag = q if int(selected.numel()) == batch else q.index_select(0, selected)
+                k_diag = k if int(selected.numel()) == batch else k.index_select(0, selected)
+                v_diag = v if int(selected.numel()) == batch else v.index_select(0, selected)
+                try:
+                    q_diag, k_diag, v_diag, _ = maybe_repeat_gqa(q_diag, k_diag, v_diag, kwargs)
+                    logits = torch.matmul(q_diag.float(), k_diag.float().transpose(-2, -1)) * float(scale)
+                    diagnostics = sampled_spectral_diagnostics(
+                        logits,
+                        logits,
+                        spatial_shape,
+                        self.config,
+                        selected,
+                        batch,
+                        cond_or_uncond,
+                    )
+                    for diagnostic in diagnostics:
+                        step.spectral_diagnostics[diagnostic.branch] = diagnostic
+                        step.rho_before = diagnostic.rho_before
+                        step.rho_after = diagnostic.rho_after
+                        step.delta_rho = diagnostic.delta_rho
+                        step.max_attn_delta = max(step.max_attn_delta or 0.0, diagnostic.attn_delta_max)
+                except AFMFallback:
+                    diagnostics = []
             out = original_func(*args, **kwargs)
             self._log_eligible(
                 mode="observe",
@@ -697,7 +833,7 @@ class AnimaAFMAttentionOverride:
                 gqa_info=None,
                 estimated_logits_mib=estimated,
                 logits_delta=None,
-                diagnostics=[],
+                diagnostics=diagnostics,
                 eligible_call_index=eligible_call_index,
                 block_id=block_id,
                 metadata=metadata,
@@ -749,7 +885,7 @@ class AnimaAFMAttentionOverride:
         logits_delta = float((edited_logits - logits).abs().max().detach().cpu().item())
         step.max_logit_delta = max(step.max_logit_delta, logits_delta)
         diagnostics: list[SpectralDiagnostic] = []
-        if self.config.spectral_diag != "off":
+        if self._should_run_spectral_diag(progress, eligible_call_index):
             diagnostics = sampled_spectral_diagnostics(
                 logits,
                 edited_logits,
@@ -790,6 +926,13 @@ class AnimaAFMAttentionOverride:
     def _progress_from_kwargs(self, kwargs: dict[str, Any]) -> ProgressInfo | None:
         transformer_options = kwargs.get("transformer_options") or {}
         return progress_from_sigmas(transformer_options)
+
+    def _should_run_spectral_diag(self, progress: ProgressInfo, eligible_call_index: int) -> bool:
+        if self.config.spectral_diag == "off":
+            return False
+        if progress.index % self.config.diagnostic_every_n_steps != 0:
+            return False
+        return self._diagnostic_call_indices is None or eligible_call_index in self._diagnostic_call_indices
 
     def _fallback(self, original_func: Callable, reason: str, *args: Any, progress: ProgressInfo | None = None, **kwargs: Any) -> torch.Tensor:
         if progress is not None:
@@ -871,37 +1014,40 @@ class AnimaAFMAttentionOverride:
     ) -> None:
         if self.config.debug_level == "off":
             return
+        should_log_snapshot = True
         if self.config.debug_level == "summary" and progress.index in self.stats.summaries_by_step:
-            return
+            should_log_snapshot = False
         verbose_count = self.stats.verbose_counts_by_step.get(progress.index, 0)
         if self.config.debug_level == "verbose" and verbose_count >= 3:
-            return
+            should_log_snapshot = False
 
         step = self.stats.step_for(progress)
-        self._log_step_summary(
-            step=step,
-            record_type="step_snapshot",
-            progress=progress,
-            snapshot_reason="eligible_call",
-            mode=mode,
-            q=q,
-            k=k,
-            v=v,
-            spatial_shape=spatial_shape,
-            alpha_lf=alpha_lf,
-            alpha_hf=alpha_hf,
-            entropy_value=entropy_value,
-            selected=selected,
-            cond_or_uncond=cond_or_uncond,
-            gqa_info=gqa_info,
-            estimated_logits_mib=estimated_logits_mib,
-            logits_delta=logits_delta,
-            eligible_call_index=eligible_call_index,
-            block_id=block_id,
-            metadata=metadata,
-        )
+        if should_log_snapshot:
+            self._log_step_summary(
+                step=step,
+                record_type="step_snapshot",
+                progress=progress,
+                snapshot_reason="eligible_call",
+                mode=mode,
+                q=q,
+                k=k,
+                v=v,
+                spatial_shape=spatial_shape,
+                alpha_lf=alpha_lf,
+                alpha_hf=alpha_hf,
+                entropy_value=entropy_value,
+                selected=selected,
+                cond_or_uncond=cond_or_uncond,
+                gqa_info=gqa_info,
+                estimated_logits_mib=estimated_logits_mib,
+                logits_delta=logits_delta,
+                eligible_call_index=eligible_call_index,
+                block_id=block_id,
+                metadata=metadata,
+            )
         for diagnostic in diagnostics:
             self._log_spectral_diag(
+                mode=mode,
                 progress=progress,
                 diagnostic=diagnostic,
                 eligible_call_index=eligible_call_index,
@@ -915,9 +1061,10 @@ class AnimaAFMAttentionOverride:
                 alpha_hf=alpha_hf,
                 estimated_logits_mib=estimated_logits_mib,
             )
-        if self.config.debug_level == "verbose":
+        if should_log_snapshot and self.config.debug_level == "verbose":
             self.stats.verbose_counts_by_step[progress.index] = verbose_count + 1
-        self.stats.summaries_by_step.add(progress.index)
+        if should_log_snapshot:
+            self.stats.summaries_by_step.add(progress.index)
 
     def _log_step_summary(
         self,
@@ -941,9 +1088,11 @@ class AnimaAFMAttentionOverride:
         eligible_call_index: int | None = None,
         block_id: str = "unknown",
         metadata: dict[str, Any] | None = None,
+        final_reason: str | None = None,
     ) -> None:
         fallback_summary = "{" + ", ".join(f"{key}:{value}" for key, value in step.fallback_reasons.items()) + "}"
         shape_summary = "{" + ", ".join(f"{key}:{value}" for key, value in step.shape_counts.items()) + "}"
+        eligible_index_summary = "{" + ", ".join(f"{key}:{value}" for key, value in sorted(step.eligible_call_indices.items())) + "}"
         suppressed_summary = "{" + ", ".join(f"{key}:{value}" for key, value in step.fallback_suppressed_reasons.items()) + "}"
         selected_indices = [] if selected is None else [int(i) for i in selected.detach().cpu().tolist()]
         q_shape = None if q is None else tuple(q.shape)
@@ -952,11 +1101,11 @@ class AnimaAFMAttentionOverride:
         message = (
             "%s %s step_index=%s num_steps=%s last_index=%s u=%.4f sigma=%.6g "
             "snapshot_reason=%s snapshot_call_index=%s mode=%s calls=%s eligible=%s edited=%s observed=%s "
-            "fallbacks=%s fallback_reasons=%s fallback_suppressed_reasons=%s "
+            "fallbacks=%s fallback_reasons=%s fallback_suppressed_reasons=%s eligible_call_indices=%s "
             "eligible_call_index=%s block_id=%s metadata=%s q=%s k=%s v=%s spatial=%s shapes=%s "
             "cond_or_uncond=%s branch_mode=%s selected_indices=%s selected_count=%s batch=%s "
             "strength=%.4f cutoff=%.4f alpha_lf=%s alpha_hf=%s entropy=%s gqa=%s "
-            "estimated_logits_mib=%s max_estimated_logits_mib=%.1f max_logit_delta=%s"
+            "estimated_logits_mib=%s max_estimated_logits_mib=%.1f max_logit_delta=%s final_reason=%s"
         )
         self._emit_text(
             message,
@@ -977,6 +1126,7 @@ class AnimaAFMAttentionOverride:
             step.fallback_calls,
             fallback_summary,
             suppressed_summary,
+            eligible_index_summary,
             eligible_call_index,
             block_id,
             metadata or {},
@@ -1003,11 +1153,13 @@ class AnimaAFMAttentionOverride:
             "n/a" if estimated_logits_mib is None else f"{estimated_logits_mib:.1f}",
             step.max_estimated_logits_mib,
             "n/a" if logits_delta is None else f"{logits_delta:.6g}",
+            final_reason,
         )
         record = self._record_base(record_type, progress)
         record.update({
             "snapshot_reason": snapshot_reason,
             "snapshot_call_index": eligible_call_index,
+            "final_reason": final_reason,
             "mode": mode,
             "calls": step.total_calls,
             "eligible": step.eligible_calls,
@@ -1016,6 +1168,7 @@ class AnimaAFMAttentionOverride:
             "fallbacks": step.fallback_calls,
             "fallback_reasons": _counter_dict(step.fallback_reasons),
             "fallback_suppressed_reasons": _counter_dict(step.fallback_suppressed_reasons),
+            "eligible_call_indices": _counter_key_dict(step.eligible_call_indices),
             "eligible_call_index": eligible_call_index,
             "block_id": block_id,
             "metadata": metadata or {},
@@ -1054,6 +1207,7 @@ class AnimaAFMAttentionOverride:
 
     def _log_spectral_diag(
         self,
+        mode: str,
         progress: ProgressInfo,
         diagnostic: SpectralDiagnostic,
         eligible_call_index: int,
@@ -1068,11 +1222,12 @@ class AnimaAFMAttentionOverride:
         estimated_logits_mib: float,
     ) -> None:
         self._emit_text(
-            "%s spectral_diag step_index=%s eligible_call_index=%s branch=%s rho_before=%.6g "
+            "%s spectral_diag step_index=%s eligible_call_index=%s mode=%s branch=%s rho_before=%.6g "
             "rho_after=%.6g delta_rho=%.6g attn_delta_mean=%.6g attn_delta_max=%.6g batch_indices=%s",
             LOG_PREFIX,
             progress.index,
             eligible_call_index,
+            mode,
             diagnostic.branch,
             diagnostic.rho_before,
             diagnostic.rho_after,
@@ -1083,6 +1238,7 @@ class AnimaAFMAttentionOverride:
         )
         record = self._record_base("spectral_diag", progress)
         record.update({
+            "mode": mode,
             "eligible_call_index": eligible_call_index,
             "q_shape": list(q.shape),
             "k_shape": list(k.shape),
@@ -1098,6 +1254,7 @@ class AnimaAFMAttentionOverride:
             "rho_before": diagnostic.rho_before,
             "rho_after": diagnostic.rho_after,
             "delta_rho": diagnostic.delta_rho,
+            "delta_rho_local": diagnostic.delta_rho,
             "attn_delta_mean": diagnostic.attn_delta_mean,
             "attn_delta_max": diagnostic.attn_delta_max,
             "estimated_logits_mib": estimated_logits_mib,

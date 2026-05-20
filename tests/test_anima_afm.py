@@ -1,5 +1,6 @@
 import json
-import math
+from pathlib import Path
+import tempfile
 import unittest
 
 import torch
@@ -359,6 +360,79 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(override.stats.steps[1].spectral_diagnostics["negative"].batch_indices, [0])
         self.assertEqual(override.stats.steps[1].spectral_diagnostics["positive"].batch_indices, [1])
 
+    def test_observe_mode_emits_branch_spectral_baseline_and_returns_original(self):
+        torch.manual_seed(271)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        original = SentinelAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(
+            mode="observe",
+            strength=0.0,
+            spectral_diag="sampled",
+            diagnostic_branch="both_separate",
+            debug_level="summary",
+            debug_format="jsonl",
+        ))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            out = override(original, q, k, v, 2, **self._cfg_kwargs(0.5))
+        self.assertTrue(torch.equal(out, original.reference_output))
+        self.assertEqual(original.calls, 1)
+
+        records = self._json_log_records(logs.records)
+        spectral = [record for record in records if record["record_type"] == "spectral_diag"]
+        by_branch = {record["diagnostic_branch"]: record for record in spectral}
+        self.assertEqual(set(by_branch), {"negative", "positive"})
+        self.assertEqual({record["mode"] for record in spectral}, {"observe"})
+        self.assertTrue(all(record["rho_before"] == record["rho_after"] for record in spectral))
+        self.assertTrue(all(record["delta_rho_local"] == 0.0 for record in spectral))
+        self.assertEqual(override.stats.edited_calls, 0)
+        self.assertEqual(override.stats.observed_calls, 1)
+
+    def test_diagnostic_call_indices_and_every_n_steps_filter_only_spectral_work(self):
+        torch.manual_seed(272)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(
+            spectral_diag="sampled",
+            diagnostic_branch="selected_mean",
+            diagnostic_call_indices="0,2",
+            diagnostic_every_n_steps=2,
+            debug_level="verbose",
+            debug_format="jsonl",
+        ))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            for _ in range(3):
+                override(reference_attention, q, k, v, 2, **self._cfg_kwargs(1.0))
+            for _ in range(3):
+                override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+            override.finalize()
+
+        records = self._json_log_records(logs.records)
+        spectral = [record for record in records if record["record_type"] == "spectral_diag"]
+        self.assertEqual([(record["step_index"], record["eligible_call_index"]) for record in spectral], [(0, 0), (0, 2)])
+        self.assertEqual(override.stats.steps[0].eligible_call_indices, {0: 1, 1: 1, 2: 1})
+        self.assertEqual(override.stats.steps[1].eligible_call_indices, {0: 1, 1: 1, 2: 1})
+
+    def test_final_summary_exposes_all_eligible_call_indices(self):
+        torch.manual_seed(273)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="verbose", debug_format="jsonl"))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            for _ in range(4):
+                override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+            override.finalize()
+        records = self._json_log_records(logs.records)
+        final_summary = [
+            record for record in records
+            if record["record_type"] == "step_final_summary" and record["step_index"] == 1
+        ][0]
+        self.assertEqual(final_summary["eligible"], 4)
+        self.assertEqual(final_summary["eligible_call_indices"], {"0": 1, "1": 1, "2": 1, "3": 1})
+
     def test_step_final_summary_counts_fallback_after_snapshot_once(self):
         torch.manual_seed(28)
         q = torch.randn(2, 2, 16, 4)
@@ -378,6 +452,44 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(len(final_step_zero), 1)
         self.assertEqual(final_step_zero[0]["fallbacks"], 1)
         self.assertEqual(final_step_zero[0]["fallback_reasons"], {"not_cross_attention": 1})
+
+    def test_last_step_finalizes_when_expected_call_count_reached(self):
+        torch.manual_seed(281)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        q_self = torch.randn(2, 2, 16, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="summary", debug_format="jsonl"))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(1.0))
+            override(reference_attention, q_self, q_self, q_self, 2, **self._cfg_kwargs(1.0))
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+            override(reference_attention, q_self, q_self, q_self, 2, **self._cfg_kwargs(0.5))
+
+        records = self._json_log_records(logs.records)
+        final_step_one = [
+            record for record in records
+            if record["record_type"] == "step_final_summary" and record["step_index"] == 1
+        ]
+        self.assertEqual(len(final_step_one), 1)
+        self.assertEqual(final_step_one[0]["final_reason"], "expected_call_count_reached")
+        self.assertEqual(final_step_one[0]["calls"], 2)
+        self.assertEqual(final_step_one[0]["fallback_reasons"], {"not_cross_attention": 1})
+
+    def test_finalize_emits_run_final_summary_for_last_step(self):
+        torch.manual_seed(282)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="summary", debug_format="jsonl"))
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+            override.finalize()
+        records = self._json_log_records(logs.records)
+        run_summary = [record for record in records if record["record_type"] == "run_final_summary"][0]
+        self.assertEqual(run_summary["last_step_index"], 1)
+        self.assertEqual(run_summary["steps"]["1"]["eligible"], 1)
+        self.assertEqual(run_summary["steps"]["1"]["eligible_call_indices"], {"0": 1})
 
     def test_eligible_call_index_and_block_metadata_are_logged(self):
         torch.manual_seed(29)
@@ -449,6 +561,28 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertTrue(any("step_snapshot" in message and message.startswith("[AnimaAFM]") for message in messages))
         json_records = self._json_log_records(logs.records)
         self.assertTrue(any(record["record_type"] == "step_snapshot" for record in json_records))
+
+    def test_jsonl_path_writes_machine_readable_records(self):
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+            jsonl_path = str(Path(temp_dir) / "afm-debug.jsonl")
+            override = AnimaAFMAttentionOverride(AFMConfig(
+                spectral_diag="sampled",
+                debug_level="summary",
+                debug_format="jsonl",
+                jsonl_path=jsonl_path,
+            ))
+            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+            lines = Path(jsonl_path).read_text(encoding="utf-8").splitlines()
+
+        records = [json.loads(line) for line in lines]
+        self.assertTrue(any(record["record_type"] == "step_snapshot" for record in records))
+        spectral = [record for record in records if record["record_type"] == "spectral_diag"]
+        self.assertTrue(spectral)
+        self.assertIn("delta_rho_local", spectral[0])
+        self.assertIn("eligible_call_index", spectral[0])
 
     def test_self_attention_falls_back(self):
         torch.manual_seed(3)

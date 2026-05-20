@@ -56,7 +56,10 @@ class AnimaAFMModelPatch(io.ComfyNode):
                 io.Combo.Input("fail_mode", options=FAIL_MODES, default="fallback", advanced=True),
                 io.Float.Input("max_logits_mib", default=1024.0, min=1.0, max=65536.0, step=16.0, advanced=True),
                 io.Combo.Input("spectral_diag", options=SPECTRAL_DIAG_MODES, default="off", advanced=True),
+                io.String.Input("diagnostic_call_indices", default="0", advanced=True),
+                io.Int.Input("diagnostic_every_n_steps", default=1, min=1, max=100, step=1, advanced=True),
                 io.Combo.Input("diagnostic_branch", options=DIAGNOSTIC_BRANCHES, default="both_separate", advanced=True),
+                io.String.Input("jsonl_path", default="", advanced=True),
                 io.Int.Input("max_verbose_fallbacks_per_step_per_reason", default=3, min=0, max=100, step=1, advanced=True),
             ],
             outputs=[
@@ -87,7 +90,10 @@ class AnimaAFMModelPatch(io.ComfyNode):
         fail_mode,
         max_logits_mib,
         spectral_diag,
+        diagnostic_call_indices,
+        diagnostic_every_n_steps,
         diagnostic_branch,
+        jsonl_path,
         max_verbose_fallbacks_per_step_per_reason,
     ) -> io.NodeOutput:
         if not is_anima_like_model(model):
@@ -110,9 +116,12 @@ class AnimaAFMModelPatch(io.ComfyNode):
             mask_width=mask_width,
             debug_level=debug_level,
             debug_format=debug_format,
+            jsonl_path=jsonl_path.strip() or None,
             fail_mode=fail_mode,
             max_logits_mib=max_logits_mib,
             spectral_diag=spectral_diag,
+            diagnostic_call_indices=diagnostic_call_indices,
+            diagnostic_every_n_steps=diagnostic_every_n_steps,
             diagnostic_branch=diagnostic_branch,
             max_verbose_fallbacks_per_step_per_reason=max_verbose_fallbacks_per_step_per_reason,
         )

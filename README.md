@@ -24,7 +24,7 @@ Recommended protocol:
    Expected: may differ slightly from true baseline due to manual attention backend; do not use as image baseline.
 4. Edit sweep: mode=edit, entropy_gate=false, strength=0.05, 0.1, 0.2.
 5. Branch sweep after branch preservation fix: branch_mode=both, positive_only, negative_only.
-6. Spectral debug: spectral_diag=sampled, diagnostic_branch=both_separate for one short run only.
+6. Spectral debug: spectral_diag=sampled, diagnostic_branch=both_separate, diagnostic_call_indices=0,7,14,21,27 for one short run only.
 ```
 
 Expected final-step snapshot for a 24-step square Anima text-to-image run with `strength=0.2`, `schedule=curve`, and `entropy_gate=false`:
@@ -35,9 +35,9 @@ q=(2, 16, 4096, 128) k=(2, 16, 512, 128) ... spatial=(64, 64)
 alpha_lf=1.0000 alpha_hf=1.2000
 ```
 
-`step_snapshot` is emitted at eligible calls. `step_final_summary` is emitted when a later step is first observed, so it includes fallback calls that happened after the snapshot; the last step may need an explicit runtime flush to produce a final summary. Summary logs include per-step fallback reason histograms, CFG branch layout (`cond_or_uncond`), selected indices, selected count, eligible call index, discovered transformer block metadata, and the estimated temporary logits size. Use `mode=observe` to confirm eligible Anima/Cosmos cross-attention shapes without replacing the original attention backend.
+`step_snapshot` is emitted at eligible calls. `step_final_summary` is emitted when a later step is first observed, and the final denoising step is finalized automatically once it reaches the inferred per-step call count. Calling the override's `finalize()` method also emits `run_final_summary`. Summary logs include per-step fallback reason histograms, CFG branch layout (`cond_or_uncond`), selected indices, selected count, eligible call index, eligible call-index histograms, discovered transformer block metadata, and the estimated temporary logits size. Use `mode=observe` to confirm eligible Anima/Cosmos cross-attention shapes and branch-separated spectral baselines without replacing the original attention backend.
 
-Set `debug_format=jsonl` or `both` for machine-readable records. JSONL spectral diagnostics include separate `negative` and `positive` records when `cond_or_uncond=[1, 0]` and `diagnostic_branch=both_separate`.
+Set `debug_format=jsonl` or `both` for machine-readable records. Set `jsonl_path` to also append those records to a JSONL file while preserving logger output. JSONL spectral diagnostics include separate `negative` and `positive` records when `cond_or_uncond=[1, 0]` and `diagnostic_branch=both_separate`. Use `diagnostic_call_indices=all` or a comma list such as `0,7,14,21,27`, plus `diagnostic_every_n_steps`, to limit spectral work while preserving stable `eligible_call_index` identities.
 
 ## Limits
 
