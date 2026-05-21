@@ -54,8 +54,11 @@ class AFMConfig:
     jsonl_path: str | None = None
     fail_mode: str = "fallback"
     max_logits_mib: float = 1024.0
+    max_peak_mib: float = 4096.0
+    target_call_indices: str = "all"
     spectral_diag: str = "off"
     diagnostic_call_indices: str = "0"
+    diagnostic_include_unselected: bool = False
     diagnostic_every_n_steps: int = 1
     diagnostic_branch: str = "both_separate"
     diagnostic_top_k: int = 8
@@ -84,6 +87,7 @@ class AFMConfig:
         if self.diagnostic_branch not in DIAGNOSTIC_BRANCHES:
             raise ValueError(f"Unsupported AFM diagnostic_branch: {self.diagnostic_branch!r}")
         parse_call_index_scope(self.diagnostic_call_indices)
+        parse_call_index_scope(self.target_call_indices)
         if not 0.0 <= self.start_percent <= 1.0:
             raise ValueError("start_percent must be in [0, 1]")
         if not 0.0 <= self.end_percent <= 1.0:
@@ -96,6 +100,8 @@ class AFMConfig:
             raise ValueError("mask_width must be non-negative")
         if self.max_logits_mib <= 0.0:
             raise ValueError("max_logits_mib must be positive")
+        if self.max_peak_mib <= 0.0:
+            raise ValueError("max_peak_mib must be positive")
         if self.diagnostic_top_k <= 0:
             raise ValueError("diagnostic_top_k must be positive")
         if self.diagnostic_max_batches <= 0:
@@ -117,6 +123,7 @@ class SpectralDiagnostic:
     delta_rho: float
     attn_delta_mean: float
     attn_delta_max: float
+    edit_applied: bool = True
 
 
 @dataclass
@@ -130,6 +137,7 @@ class StepStats:
     eligible_calls: int = 0
     edited_calls: int = 0
     observed_calls: int = 0
+    target_skipped_calls: int = 0
     fallback_calls: int = 0
     fallback_reasons: Counter[str] = field(default_factory=Counter)
     shape_counts: Counter[str] = field(default_factory=Counter)
@@ -141,8 +149,10 @@ class StepStats:
     rho_after: float | None = None
     delta_rho: float | None = None
     max_estimated_logits_mib: float = 0.0
+    max_estimated_peak_mib: float = 0.0
     eligible_call_metadata: dict[int, dict[str, Any]] = field(default_factory=dict)
     spectral_diagnostics: dict[str, SpectralDiagnostic] = field(default_factory=dict)
+    spectral_diagnostic_records: list[tuple[int, SpectralDiagnostic]] = field(default_factory=list)
     fallback_suppressed_reasons: Counter[str] = field(default_factory=Counter)
 
 
@@ -159,6 +169,7 @@ class GQAInfo:
 class AFMRuntimeStats:
     edited_calls: int = 0
     observed_calls: int = 0
+    target_skipped_calls: int = 0
     fallback_calls: int = 0
     fallback_reasons: dict[str, int] = field(default_factory=dict)
     steps: dict[int, StepStats] = field(default_factory=dict)
@@ -374,25 +385,44 @@ def parse_call_index_scope(spec: str) -> set[int] | None:
     if normalized == "all":
         return None
     if not normalized:
-        raise ValueError("diagnostic_call_indices must be 'all' or a comma-separated list of non-negative integers")
+        raise ValueError("call index scope must be 'all' or a comma-separated list of non-negative integers/ranges")
 
     indices: set[int] = set()
     for raw_part in normalized.split(","):
         part = raw_part.strip()
         if not part:
-            raise ValueError(f"Invalid diagnostic_call_indices entry in {spec!r}")
-        try:
-            index = int(part)
-        except ValueError as exc:
-            raise ValueError(f"Invalid diagnostic_call_indices entry: {part!r}") from exc
-        if index < 0:
-            raise ValueError("diagnostic_call_indices entries must be non-negative")
-        indices.add(index)
+            raise ValueError(f"Invalid call index scope entry in {spec!r}")
+        if "-" in part:
+            start_text, sep, end_text = part.partition("-")
+            if not sep or not start_text or not end_text:
+                raise ValueError(f"Invalid call index range: {part!r}")
+            try:
+                start = int(start_text)
+                end = int(end_text)
+            except ValueError as exc:
+                raise ValueError(f"Invalid call index range: {part!r}") from exc
+            if start < 0 or end < 0:
+                raise ValueError("call index scope entries must be non-negative")
+            if end < start:
+                raise ValueError(f"Invalid descending call index range: {part!r}")
+            indices.update(range(start, end + 1))
+        else:
+            try:
+                index = int(part)
+            except ValueError as exc:
+                raise ValueError(f"Invalid call index scope entry: {part!r}") from exc
+            if index < 0:
+                raise ValueError("call index scope entries must be non-negative")
+            indices.add(index)
     return indices
 
 
 def estimate_logits_mib(batch: int, heads: int, query_len: int, text_len: int, bytes_per: int = 4) -> float:
     return batch * heads * query_len * text_len * bytes_per / (1024**2)
+
+
+def estimate_peak_mib(logits_mib: float, peak_multiplier: float = 4.0) -> float:
+    return float(logits_mib) * peak_multiplier
 
 
 class AFMFallback(RuntimeError):
@@ -538,6 +568,7 @@ def sampled_spectral_diagnostics(
     selected: torch.Tensor,
     full_batch: int,
     cond_or_uncond: list[int] | None,
+    edit_applied: bool = True,
 ) -> list[SpectralDiagnostic]:
     diagnostics: list[SpectralDiagnostic] = []
     for branch, positions, batch_indices in diagnostic_batch_positions(
@@ -574,6 +605,7 @@ def sampled_spectral_diagnostics(
                 delta_rho=rho_after - rho_before,
                 attn_delta_mean=float(attn_delta.mean().detach().cpu().item()),
                 attn_delta_max=float(attn_delta.max().detach().cpu().item()),
+                edit_applied=edit_applied,
             ))
     return diagnostics
 
@@ -585,6 +617,7 @@ class AnimaAFMAttentionOverride:
         self.stats = AFMRuntimeStats()
         self.run_id = f"afm-{id(self):x}"
         self._diagnostic_call_indices = parse_call_index_scope(config.diagnostic_call_indices)
+        self._target_call_indices = parse_call_index_scope(config.target_call_indices)
 
     def finalize(self) -> None:
         if self.stats.active_step_index is not None:
@@ -628,6 +661,34 @@ class AnimaAFMAttentionOverride:
             return
         self._finalize_step(progress.index, "expected_call_count_reached")
 
+    def _target_call_selected(self, eligible_call_index: int) -> bool:
+        return self._target_call_indices is None or eligible_call_index in self._target_call_indices
+
+    def _update_peak_estimate(self, step: StepStats, estimated_logits_mib: float) -> float:
+        estimated_peak_mib = estimate_peak_mib(estimated_logits_mib)
+        step.max_estimated_logits_mib = max(step.max_estimated_logits_mib, estimated_logits_mib)
+        step.max_estimated_peak_mib = max(step.max_estimated_peak_mib, estimated_peak_mib)
+        return estimated_peak_mib
+
+    def _record_spectral_diagnostics(
+        self,
+        step: StepStats,
+        eligible_call_index: int,
+        diagnostics: list[SpectralDiagnostic],
+    ) -> None:
+        for diagnostic in diagnostics:
+            step.spectral_diagnostics[diagnostic.branch] = diagnostic
+            step.spectral_diagnostic_records.append((eligible_call_index, diagnostic))
+            step.rho_before = diagnostic.rho_before
+            step.rho_after = diagnostic.rho_after
+            step.delta_rho = diagnostic.delta_rho
+            step.max_attn_delta = max(step.max_attn_delta or 0.0, diagnostic.attn_delta_max)
+
+    def _unselected_indices(self, batch: int, selected: torch.Tensor) -> torch.Tensor:
+        selected_set = set(int(index) for index in selected.detach().cpu().tolist())
+        unselected = [index for index in range(batch) if index not in selected_set]
+        return torch.tensor(unselected, dtype=torch.long, device=selected.device)
+
     def _emit_text(self, message: str, *args: Any) -> None:
         if self.config.debug_format in ("text", "both"):
             LOGGER.info(message, *args)
@@ -658,22 +719,59 @@ class AnimaAFMAttentionOverride:
             })
         return record
 
+    def _spectral_summary(self, step: StepStats) -> dict[str, Any]:
+        records = step.spectral_diagnostic_records
+        if not records:
+            return {
+                "spectral_diag_count": 0,
+                "spectral_delta_rho_mean": None,
+                "spectral_delta_rho_min": None,
+                "spectral_delta_rho_max": None,
+                "spectral_by_call_branch": {},
+            }
+
+        deltas = [diagnostic.delta_rho for _, diagnostic in records]
+        by_key: dict[str, list[SpectralDiagnostic]] = {}
+        for eligible_call_index, diagnostic in records:
+            by_key.setdefault(f"{eligible_call_index}/{diagnostic.branch}", []).append(diagnostic)
+
+        return {
+            "spectral_diag_count": len(records),
+            "spectral_delta_rho_mean": sum(deltas) / len(deltas),
+            "spectral_delta_rho_min": min(deltas),
+            "spectral_delta_rho_max": max(deltas),
+            "spectral_by_call_branch": {
+                key: {
+                    "n": len(items),
+                    "delta_rho_mean": sum(item.delta_rho for item in items) / len(items),
+                    "rho_before_mean": sum(item.rho_before for item in items) / len(items),
+                    "rho_after_mean": sum(item.rho_after for item in items) / len(items),
+                    "edit_applied": any(item.edit_applied for item in items),
+                }
+                for key, items in sorted(by_key.items())
+            },
+        }
+
     def _step_totals_record(self, step: StepStats) -> dict[str, Any]:
+        spectral_summary = self._spectral_summary(step)
         return {
             "calls": step.total_calls,
             "eligible": step.eligible_calls,
             "edited": step.edited_calls,
             "observed": step.observed_calls,
+            "target_skipped": step.target_skipped_calls,
             "fallbacks": step.fallback_calls,
             "fallback_reasons": _counter_dict(step.fallback_reasons),
             "fallback_suppressed_reasons": _counter_dict(step.fallback_suppressed_reasons),
             "eligible_call_indices": _counter_key_dict(step.eligible_call_indices),
             "shape_counts": _counter_dict(step.shape_counts),
             "max_estimated_logits_mib": step.max_estimated_logits_mib,
+            "max_peak_mib": step.max_estimated_peak_mib,
             "max_logit_delta": step.max_logit_delta,
-            "rho_before": step.rho_before,
-            "rho_after": step.rho_after,
-            "delta_rho": step.delta_rho,
+            "rho_before": None,
+            "rho_after": None,
+            "delta_rho": None,
+            **spectral_summary,
         }
 
     def _log_run_final_summary(self) -> None:
@@ -688,6 +786,7 @@ class AnimaAFMAttentionOverride:
             "expected_total_calls_per_step": self.stats.expected_total_calls_per_step,
             "edited": self.stats.edited_calls,
             "observed": self.stats.observed_calls,
+            "target_skipped": self.stats.target_skipped_calls,
             "fallbacks": self.stats.fallback_calls,
             "fallback_reasons": dict(self.stats.fallback_reasons),
             "steps": {
@@ -790,7 +889,7 @@ class AnimaAFMAttentionOverride:
             self.stats.observed_calls += 1
             step.observed_calls += 1
             estimated = estimate_logits_mib(int(selected.numel()), int(q.shape[1]), query_len, text_len)
-            step.max_estimated_logits_mib = max(step.max_estimated_logits_mib, estimated)
+            estimated_peak = self._update_peak_estimate(step, estimated)
             diagnostics: list[SpectralDiagnostic] = []
             if self._should_run_spectral_diag(progress, eligible_call_index):
                 scale = kwargs.get("scale", q.shape[-1] ** -0.5)
@@ -808,13 +907,9 @@ class AnimaAFMAttentionOverride:
                         selected,
                         batch,
                         cond_or_uncond,
+                        edit_applied=False,
                     )
-                    for diagnostic in diagnostics:
-                        step.spectral_diagnostics[diagnostic.branch] = diagnostic
-                        step.rho_before = diagnostic.rho_before
-                        step.rho_after = diagnostic.rho_after
-                        step.delta_rho = diagnostic.delta_rho
-                        step.max_attn_delta = max(step.max_attn_delta or 0.0, diagnostic.attn_delta_max)
+                    self._record_spectral_diagnostics(step, eligible_call_index, diagnostics)
                 except AFMFallback:
                     diagnostics = []
             out = original_func(*args, **kwargs)
@@ -832,6 +927,58 @@ class AnimaAFMAttentionOverride:
                 cond_or_uncond=cond_or_uncond,
                 gqa_info=None,
                 estimated_logits_mib=estimated,
+                estimated_peak_mib=estimated_peak,
+                logits_delta=None,
+                diagnostics=diagnostics,
+                eligible_call_index=eligible_call_index,
+                block_id=block_id,
+                metadata=metadata,
+            )
+            return out
+
+        if not self._target_call_selected(eligible_call_index):
+            self.stats.target_skipped_calls += 1
+            step.target_skipped_calls += 1
+            estimated = estimate_logits_mib(int(selected.numel()), int(q.shape[1]), query_len, text_len)
+            estimated_peak = self._update_peak_estimate(step, estimated)
+            diagnostics: list[SpectralDiagnostic] = []
+            if self._should_run_spectral_diag(progress, eligible_call_index):
+                scale = kwargs.get("scale", q.shape[-1] ** -0.5)
+                q_diag = q if int(selected.numel()) == batch else q.index_select(0, selected)
+                k_diag = k if int(selected.numel()) == batch else k.index_select(0, selected)
+                v_diag = v if int(selected.numel()) == batch else v.index_select(0, selected)
+                try:
+                    q_diag, k_diag, v_diag, _ = maybe_repeat_gqa(q_diag, k_diag, v_diag, kwargs)
+                    logits = torch.matmul(q_diag.float(), k_diag.float().transpose(-2, -1)) * float(scale)
+                    diagnostics = sampled_spectral_diagnostics(
+                        logits,
+                        logits,
+                        spatial_shape,
+                        self.config,
+                        selected,
+                        batch,
+                        cond_or_uncond,
+                        edit_applied=False,
+                    )
+                    self._record_spectral_diagnostics(step, eligible_call_index, diagnostics)
+                except AFMFallback:
+                    diagnostics = []
+            out = original_func(*args, **kwargs)
+            self._log_eligible(
+                mode="passthrough",
+                progress=progress,
+                q=q,
+                k=k,
+                v=v,
+                spatial_shape=spatial_shape,
+                alpha_lf=None,
+                alpha_hf=None,
+                entropy_value=None,
+                selected=selected,
+                cond_or_uncond=cond_or_uncond,
+                gqa_info=None,
+                estimated_logits_mib=estimated,
+                estimated_peak_mib=estimated_peak,
                 logits_delta=None,
                 diagnostics=diagnostics,
                 eligible_call_index=eligible_call_index,
@@ -852,13 +999,21 @@ class AnimaAFMAttentionOverride:
             return self._fallback(original_func, exc.reason, *args, progress=progress, **kwargs)
 
         estimated = estimate_logits_mib(int(q_sel.shape[0]), int(q_sel.shape[1]), int(q_sel.shape[-2]), int(k_sel.shape[-2]))
-        step.max_estimated_logits_mib = max(step.max_estimated_logits_mib, estimated)
+        estimated_peak = self._update_peak_estimate(step, estimated)
         if estimated > self.config.max_logits_mib:
             reason = "vram_guard_exceeded"
             if self.config.fail_mode == "raise":
                 raise RuntimeError(
                     f"{LOG_PREFIX} {reason}: q={tuple(q_sel.shape)} k={tuple(k_sel.shape)} "
                     f"estimated_logits_mib={estimated:.1f} guard={self.config.max_logits_mib:.1f}"
+                )
+            return self._fallback(original_func, reason, *args, progress=progress, **kwargs)
+        if estimated_peak > self.config.max_peak_mib:
+            reason = "peak_vram_guard_exceeded"
+            if self.config.fail_mode == "raise":
+                raise RuntimeError(
+                    f"{LOG_PREFIX} {reason}: q={tuple(q_sel.shape)} k={tuple(k_sel.shape)} "
+                    f"estimated_peak_mib={estimated_peak:.1f} guard={self.config.max_peak_mib:.1f}"
                 )
             return self._fallback(original_func, reason, *args, progress=progress, **kwargs)
 
@@ -894,13 +1049,33 @@ class AnimaAFMAttentionOverride:
                 selected,
                 batch,
                 cond_or_uncond,
+                edit_applied=True,
             )
-            for diagnostic in diagnostics:
-                step.spectral_diagnostics[diagnostic.branch] = diagnostic
-                step.rho_before = diagnostic.rho_before
-                step.rho_after = diagnostic.rho_after
-                step.delta_rho = diagnostic.delta_rho
-                step.max_attn_delta = max(step.max_attn_delta or 0.0, diagnostic.attn_delta_max)
+            if self.config.diagnostic_include_unselected and int(selected.numel()) < batch:
+                unselected = self._unselected_indices(batch, selected)
+                if unselected.numel() > 0:
+                    q_unselected = q.index_select(0, unselected)
+                    k_unselected = k.index_select(0, unselected)
+                    v_unselected = v.index_select(0, unselected)
+                    try:
+                        q_unselected, k_unselected, v_unselected, _ = maybe_repeat_gqa(q_unselected, k_unselected, v_unselected, kwargs)
+                        passthrough_logits = torch.matmul(
+                            q_unselected.float(),
+                            k_unselected.float().transpose(-2, -1),
+                        ) * float(scale)
+                        diagnostics.extend(sampled_spectral_diagnostics(
+                            passthrough_logits,
+                            passthrough_logits,
+                            spatial_shape,
+                            self.config,
+                            unselected,
+                            batch,
+                            cond_or_uncond,
+                            edit_applied=False,
+                        ))
+                    except AFMFallback:
+                        pass
+            self._record_spectral_diagnostics(step, eligible_call_index, diagnostics)
         self._log_eligible(
             mode="edit",
             progress=progress,
@@ -915,6 +1090,7 @@ class AnimaAFMAttentionOverride:
             cond_or_uncond=cond_or_uncond,
             gqa_info=gqa_info,
             estimated_logits_mib=estimated,
+            estimated_peak_mib=estimated_peak,
             logits_delta=logits_delta,
             diagnostics=diagnostics,
             eligible_call_index=eligible_call_index,
@@ -1006,6 +1182,7 @@ class AnimaAFMAttentionOverride:
         cond_or_uncond: list[int] | None,
         gqa_info: GQAInfo | None,
         estimated_logits_mib: float,
+        estimated_peak_mib: float,
         logits_delta: float | None,
         diagnostics: list[SpectralDiagnostic],
         eligible_call_index: int,
@@ -1040,6 +1217,7 @@ class AnimaAFMAttentionOverride:
                 cond_or_uncond=cond_or_uncond,
                 gqa_info=gqa_info,
                 estimated_logits_mib=estimated_logits_mib,
+                estimated_peak_mib=estimated_peak_mib,
                 logits_delta=logits_delta,
                 eligible_call_index=eligible_call_index,
                 block_id=block_id,
@@ -1060,6 +1238,7 @@ class AnimaAFMAttentionOverride:
                 alpha_lf=alpha_lf,
                 alpha_hf=alpha_hf,
                 estimated_logits_mib=estimated_logits_mib,
+                estimated_peak_mib=estimated_peak_mib,
             )
         if should_log_snapshot and self.config.debug_level == "verbose":
             self.stats.verbose_counts_by_step[progress.index] = verbose_count + 1
@@ -1084,6 +1263,7 @@ class AnimaAFMAttentionOverride:
         cond_or_uncond: list[int] | None = None,
         gqa_info: GQAInfo | None = None,
         estimated_logits_mib: float | None = None,
+        estimated_peak_mib: float | None = None,
         logits_delta: float | None = None,
         eligible_call_index: int | None = None,
         block_id: str = "unknown",
@@ -1098,14 +1278,20 @@ class AnimaAFMAttentionOverride:
         q_shape = None if q is None else tuple(q.shape)
         k_shape = None if k is None else tuple(k.shape)
         v_shape = None if v is None else tuple(v.shape)
+        summary_rho_before = None if record_type in ("step_final_summary", "run_final_summary") else step.rho_before
+        summary_rho_after = None if record_type in ("step_final_summary", "run_final_summary") else step.rho_after
+        summary_delta_rho = None if record_type in ("step_final_summary", "run_final_summary") else step.delta_rho
+        effective_peak_mib = step.max_estimated_peak_mib if estimated_peak_mib is None else estimated_peak_mib
+        spectral_summary = self._spectral_summary(step)
         message = (
             "%s %s step_index=%s num_steps=%s last_index=%s u=%.4f sigma=%.6g "
             "snapshot_reason=%s snapshot_call_index=%s mode=%s calls=%s eligible=%s edited=%s observed=%s "
-            "fallbacks=%s fallback_reasons=%s fallback_suppressed_reasons=%s eligible_call_indices=%s "
+            "target_skipped=%s fallbacks=%s fallback_reasons=%s fallback_suppressed_reasons=%s eligible_call_indices=%s "
             "eligible_call_index=%s block_id=%s metadata=%s q=%s k=%s v=%s spatial=%s shapes=%s "
             "cond_or_uncond=%s branch_mode=%s selected_indices=%s selected_count=%s batch=%s "
             "strength=%.4f cutoff=%.4f alpha_lf=%s alpha_hf=%s entropy=%s gqa=%s "
-            "estimated_logits_mib=%s max_estimated_logits_mib=%.1f max_logit_delta=%s final_reason=%s"
+            "estimated_logits_mib=%s estimated_peak_mib=%s max_estimated_logits_mib=%.1f max_peak_mib=%.1f "
+            "spectral_diag_count=%s max_logit_delta=%s final_reason=%s"
         )
         self._emit_text(
             message,
@@ -1123,6 +1309,7 @@ class AnimaAFMAttentionOverride:
             step.eligible_calls,
             step.edited_calls,
             step.observed_calls,
+            step.target_skipped_calls,
             step.fallback_calls,
             fallback_summary,
             suppressed_summary,
@@ -1151,7 +1338,10 @@ class AnimaAFMAttentionOverride:
                 f"kv_heads_after={gqa_info.kv_heads_after}"
             ),
             "n/a" if estimated_logits_mib is None else f"{estimated_logits_mib:.1f}",
+            f"{effective_peak_mib:.1f}",
             step.max_estimated_logits_mib,
+            step.max_estimated_peak_mib,
+            spectral_summary["spectral_diag_count"],
             "n/a" if logits_delta is None else f"{logits_delta:.6g}",
             final_reason,
         )
@@ -1165,6 +1355,7 @@ class AnimaAFMAttentionOverride:
             "eligible": step.eligible_calls,
             "edited": step.edited_calls,
             "observed": step.observed_calls,
+            "target_skipped": step.target_skipped_calls,
             "fallbacks": step.fallback_calls,
             "fallback_reasons": _counter_dict(step.fallback_reasons),
             "fallback_suppressed_reasons": _counter_dict(step.fallback_suppressed_reasons),
@@ -1187,9 +1378,9 @@ class AnimaAFMAttentionOverride:
             "cutoff": float(self.config.cutoff),
             "alpha_lf": alpha_lf,
             "alpha_hf": alpha_hf,
-            "rho_before": step.rho_before,
-            "rho_after": step.rho_after,
-            "delta_rho": step.delta_rho,
+            "rho_before": summary_rho_before,
+            "rho_after": summary_rho_after,
+            "delta_rho": summary_delta_rho,
             "entropy": entropy_value,
             "gqa": None if gqa_info is None else {
                 "enabled": gqa_info.enabled,
@@ -1199,10 +1390,14 @@ class AnimaAFMAttentionOverride:
                 "kv_heads_after": gqa_info.kv_heads_after,
             },
             "estimated_logits_mib": estimated_logits_mib,
-            "estimated_peak_mib": None,
+            "estimated_peak_mib": effective_peak_mib,
             "max_estimated_logits_mib": step.max_estimated_logits_mib,
+            "max_peak_mib": step.max_estimated_peak_mib,
+            "target_call_indices": self.config.target_call_indices,
+            "diagnostic_include_unselected": self.config.diagnostic_include_unselected,
             "max_logit_delta": logits_delta,
         })
+        record.update(spectral_summary)
         self._emit_jsonl(record)
 
     def _log_spectral_diag(
@@ -1220,10 +1415,11 @@ class AnimaAFMAttentionOverride:
         alpha_lf: float | None,
         alpha_hf: float | None,
         estimated_logits_mib: float,
+        estimated_peak_mib: float,
     ) -> None:
         self._emit_text(
             "%s spectral_diag step_index=%s eligible_call_index=%s mode=%s branch=%s rho_before=%.6g "
-            "rho_after=%.6g delta_rho=%.6g attn_delta_mean=%.6g attn_delta_max=%.6g batch_indices=%s",
+            "rho_after=%.6g delta_rho=%.6g edit_applied=%s attn_delta_mean=%.6g attn_delta_max=%.6g batch_indices=%s",
             LOG_PREFIX,
             progress.index,
             eligible_call_index,
@@ -1232,6 +1428,7 @@ class AnimaAFMAttentionOverride:
             diagnostic.rho_before,
             diagnostic.rho_after,
             diagnostic.delta_rho,
+            diagnostic.edit_applied,
             diagnostic.attn_delta_mean,
             diagnostic.attn_delta_max,
             diagnostic.batch_indices,
@@ -1255,10 +1452,11 @@ class AnimaAFMAttentionOverride:
             "rho_after": diagnostic.rho_after,
             "delta_rho": diagnostic.delta_rho,
             "delta_rho_local": diagnostic.delta_rho,
+            "edit_applied": diagnostic.edit_applied,
             "attn_delta_mean": diagnostic.attn_delta_mean,
             "attn_delta_max": diagnostic.attn_delta_max,
             "estimated_logits_mib": estimated_logits_mib,
-            "estimated_peak_mib": None,
+            "estimated_peak_mib": estimated_peak_mib,
         })
         self._emit_jsonl(record)
 
