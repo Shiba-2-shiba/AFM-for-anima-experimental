@@ -1,0 +1,30 @@
+{
+  "B_call0_vs_A": {
+    "rows": 200,
+    "matched": 200,
+    "missing_observe": 0,
+    "edited_rows": 40,
+    "edited_delta_rho_vs_observe_mean": -0.0013084307312965394,
+    "late_edited_delta_rho_vs_observe_mean": 0.01288086548447609
+  },
+  "C_call7-13_vs_A": {
+    "rows": 200,
+    "matched": 200,
+    "missing_observe": 0,
+    "edited_rows": 40,
+    "edited_delta_rho_vs_observe_mean": 0.0031811989843845367,
+    "late_edited_delta_rho_vs_observe_mean": 0.038908716291189194
+  },
+  "D_positive-only-preservation_vs_A": {
+    "rows": 200,
+    "matched": 200,
+    "missing_observe": 0,
+    "edited_rows": 100,
+    "edited_delta_rho_vs_observe_mean": 0.010279634296894073,
+    "late_edited_delta_rho_vs_observe_mean": 0.04261689484119415
+  },
+  "D_branch_preservation_counts": {
+    "negative/edit/passthrough/False": 100,
+    "positive/edit/edited/True": 100
+  }
+}

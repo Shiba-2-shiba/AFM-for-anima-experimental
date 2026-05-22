@@ -1,0 +1,4 @@
+comparison,rows,matched,missing_observe,duplicate_observe_pairs,duplicate_edit_pairs,overall_delta_rho_local_mean,overall_delta_rho_vs_observe_mean,edited_rows,edited_delta_rho_local_mean,edited_delta_rho_vs_observe_mean,late_start_step,late_rows,late_edited_delta_rho_vs_observe_mean,max_abs_delta_rho_vs_observe
+B_call0_vs_A,200,200,0,0,0,,,40,,-0.0013084307312965394,16,40,0.01288086548447609,
+C_call7-13_vs_A,200,200,0,0,0,,,40,,0.0031811989843845367,16,40,0.038908716291189194,
+D_positive-only-preservation_vs_A,200,200,0,0,0,,,100,,0.010279634296894073,16,40,0.04261689484119415,

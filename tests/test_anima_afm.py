@@ -345,8 +345,13 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertIsInstance(snapshot["estimated_peak_mib"], float)
         self.assertAlmostEqual(snapshot["estimated_peak_mib"], estimate_peak_mib(snapshot["estimated_logits_mib"]))
         self.assertEqual(snapshot["max_peak_mib"], snapshot["estimated_peak_mib"])
-        self.assertEqual(snapshot["memory_estimate"]["method"], "conservative_full_fft")
+        self.assertEqual(snapshot["memory_estimate"]["method"], "conservative_full_fft_multiplier")
         self.assertAlmostEqual(snapshot["memory_estimate"]["logits_mib"], snapshot["estimated_logits_mib"])
+        self.assertEqual(snapshot["memory_estimate"]["selected_batch"], 1)
+        self.assertEqual(snapshot["memory_estimate"]["heads"], 2)
+        self.assertEqual(snapshot["memory_estimate"]["query_len"], 16)
+        self.assertEqual(snapshot["memory_estimate"]["text_len"], 5)
+        self.assertIn("fft_complex_mib", snapshot["memory_estimate"])
 
         original = CountingAttention()
         guarded = AnimaAFMAttentionOverride(AFMConfig(max_logits_mib=1024.0, max_peak_mib=0.0001))
@@ -519,6 +524,44 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(by_branch["negative"]["rho_before"], by_branch["negative"]["rho_after"])
         self.assertEqual(by_branch["negative"]["delta_rho_local"], 0.0)
 
+    def test_diagnostic_include_unselected_does_not_change_tensor_output(self):
+        torch.manual_seed(274)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        kwargs = self._cfg_kwargs(0.5)
+        base_config = {
+            "strength": 0.2,
+            "branch_mode": "positive_only",
+            "spectral_diag": "sampled",
+            "diagnostic_branch": "both_separate",
+            "debug_level": "summary",
+            "debug_format": "jsonl",
+        }
+        without_unselected = AnimaAFMAttentionOverride(AFMConfig(
+            **base_config,
+            diagnostic_include_unselected=False,
+        ))
+        with_unselected = AnimaAFMAttentionOverride(AFMConfig(
+            **base_config,
+            diagnostic_include_unselected=True,
+        ))
+
+        out_without = without_unselected(reference_attention, q, k, v, 2, **kwargs)
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            out_with = with_unselected(reference_attention, q, k, v, 2, **kwargs)
+        torch.testing.assert_close(out_with, out_without, rtol=0, atol=0)
+
+        records = self._json_log_records(logs.records)
+        by_branch = {
+            record["diagnostic_branch"]: record
+            for record in records
+            if record["record_type"] == "spectral_diag"
+        }
+        self.assertEqual(by_branch["negative"]["schema_version"], 2)
+        self.assertEqual(by_branch["negative"]["diagnostic_mode"], "passthrough")
+        self.assertFalse(by_branch["negative"]["edit_applied"])
+
     def test_observe_mode_emits_branch_spectral_baseline_and_returns_original(self):
         torch.manual_seed(271)
         q = torch.randn(2, 2, 16, 4)
@@ -670,12 +713,14 @@ class AnimaAFMTests(unittest.TestCase):
             override(reference_attention, q, k, v, 2, **kwargs)
         records = self._json_log_records(logs.records)
         snapshots = [record for record in records if record["record_type"] == "step_snapshot"]
-        discovery = [record for record in records if record["record_type"] == "transformer_metadata_discovery"]
+        discovery = [record for record in records if record["record_type"] == "metadata_discovery"]
         self.assertEqual(len(discovery), 1)
         self.assertEqual(discovery[0]["schema_version"], 2)
+        self.assertTrue(discovery[0]["metadata_available"])
         self.assertEqual(discovery[0]["metadata_status"], "found")
-        self.assertIn("transformer_options_keys", discovery[0])
-        self.assertIn("block", discovery[0]["transformer_options_summary"])
+        self.assertIn("transformer_option_keys", discovery[0])
+        self.assertIn("block", discovery[0]["safe_transformer_options"])
+        self.assertEqual(discovery[0]["eligible_call_to_block"], {"0": "input:7"})
         self.assertEqual([record["eligible_call_index"] for record in snapshots], [0, 1])
         self.assertEqual(snapshots[0]["block_id"], "input:7")
         self.assertEqual(snapshots[0]["metadata"]["module_path"], "diffusion_model.blocks.7.attn")
@@ -689,7 +734,8 @@ class AnimaAFMTests(unittest.TestCase):
             override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
         records = self._json_log_records(logs.records)
         snapshot = [record for record in records if record["record_type"] == "step_snapshot"][0]
-        discovery = [record for record in records if record["record_type"] == "transformer_metadata_discovery"][0]
+        discovery = [record for record in records if record["record_type"] == "metadata_discovery"][0]
+        self.assertFalse(discovery["metadata_available"])
         self.assertEqual(discovery["metadata_status"], "not_found")
         self.assertEqual(snapshot["block_id"], "unknown")
         self.assertEqual(snapshot["metadata"], {})

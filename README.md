@@ -60,6 +60,31 @@ python scripts/compare_afm_runs.py logs/observe.jsonl logs/edit.jsonl --format c
 python scripts/compare_afm_runs.py out/observe.csv out/edit.csv --input-format csv --summary --late-start-step 16 --format json
 ```
 
+For multi-run analysis, compare each edit run against the same observe baseline, then aggregate:
+
+```bash
+python scripts/compare_afm_runs.py out/A_observe.parsed.csv out/B_call0.parsed.csv \
+  --input-format csv --format csv > out/compare_B_call0_vs_A.csv
+python scripts/compare_afm_runs.py out/A_observe.parsed.csv out/C_call7-13.parsed.csv \
+  --input-format csv --format csv > out/compare_C_call7-13_vs_A.csv
+python scripts/compare_afm_runs.py out/A_observe.parsed.csv out/D_positive-only-preservation.parsed.csv \
+  --input-format csv --format csv > out/compare_D_positive-only-preservation_vs_A.csv
+
+python scripts/summarize_afm_experiments.py \
+  --compare B_call0_vs_A=out/compare_B_call0_vs_A.csv \
+  --compare C_call7-13_vs_A=out/compare_C_call7-13_vs_A.csv \
+  --compare D_positive-only-preservation_vs_A=out/compare_D_positive-only-preservation_vs_A.csv \
+  --late-start-step 16 \
+  --preservation-run D_positive-only-preservation_vs_A \
+  --require-branch-preservation \
+  --report-md \
+  --out-dir out/summary
+```
+
+`compare_afm_runs.py` reports `duplicate_observe_pairs`, `duplicate_edit_pairs`, and `unmatched_observe_pairs` in summary mode. Use `--fail-on-duplicate-pairs` and `--fail-on-unmatched-observe` when validating a research dataset before aggregation.
+
+In branch-scoped runs, unselected branch diagnostics may have nonzero `delta_rho_vs_observe` because the generation trajectory changed. That does not mean AFM was directly applied to that branch. Use `edit_applied`, `diagnostic_mode`, and tensor-level branch preservation tests to distinguish direct editing from trajectory effects.
+
 ## Next Logs
 
 Collect these with the same seed, prompt, sampler, and latent:

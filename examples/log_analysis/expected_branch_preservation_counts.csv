@@ -1,0 +1,3 @@
+comparison,diagnostic_branch,call_mode,diagnostic_mode,edit_applied,rows,delta_rho_local_mean,attn_delta_mean_mean,attn_delta_max_max
+D_positive-only-preservation_vs_A,negative,edit,passthrough,False,100,,,
+D_positive-only-preservation_vs_A,positive,edit,edited,True,100,,,

@@ -44,6 +44,7 @@ FIELDNAMES = [
     "attn_delta_max",
     "estimated_logits_mib",
     "estimated_peak_mib",
+    "memory_estimate_json",
 ]
 
 
@@ -127,6 +128,7 @@ def record_to_row(record: dict[str, Any]) -> dict[str, Any]:
         "attn_delta_max": record.get("attn_delta_max"),
         "estimated_logits_mib": record.get("estimated_logits_mib"),
         "estimated_peak_mib": record.get("estimated_peak_mib"),
+        "memory_estimate_json": _json_cell(record.get("memory_estimate")),
     }
 
 

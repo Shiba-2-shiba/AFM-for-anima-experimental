@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,10 @@ FIELDNAMES = [
     "step_index",
     "eligible_call_index",
     "branch",
+    "observe_pair_count",
+    "edit_pair_count",
+    "observe_duplicate",
+    "edit_duplicate",
     "rho_observe",
     "rho_edit_before",
     "rho_edit_after",
@@ -37,9 +41,25 @@ FIELDNAMES = [
     "selected_indices",
 ]
 
+PAIR_KEY_COLUMNS = ["step_index", "eligible_call_index", "branch"]
+
+
+class PairRows(list):
+    def __init__(self, rows: list[dict[str, Any]], pair_analysis: dict[str, Any]):
+        super().__init__(rows)
+        self.pair_analysis = pair_analysis
+
 
 def _key(row: dict[str, Any]) -> tuple[Any, Any, Any]:
     return _cell(row.get("step_index")), _cell(row.get("eligible_call_index")), row.get("branch")
+
+
+def _key_record(key: tuple[Any, Any, Any]) -> dict[str, Any]:
+    return {
+        "step_index": key[0],
+        "eligible_call_index": key[1],
+        "branch": key[2],
+    }
 
 
 def _cell(value: Any) -> Any:
@@ -119,7 +139,27 @@ def read_rows(path: str | Path, input_format: str = "auto") -> list[dict[str, An
     return parse_log_file(path)
 
 
-def compare_rows(observe_rows: list[dict[str, Any]], edit_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _pair_analysis(
+    observe_counts: Counter[tuple[Any, Any, Any]],
+    edit_counts: Counter[tuple[Any, Any, Any]],
+) -> dict[str, Any]:
+    duplicate_observe = [key for key, count in observe_counts.items() if count > 1]
+    duplicate_edit = [key for key, count in edit_counts.items() if count > 1]
+    unmatched_observe = [key for key in observe_counts if key not in edit_counts]
+    return {
+        "pair_key_columns": PAIR_KEY_COLUMNS,
+        "duplicate_observe_pairs": len(duplicate_observe),
+        "duplicate_edit_pairs": len(duplicate_edit),
+        "unmatched_observe_pairs": len(unmatched_observe),
+        "duplicate_observe_keys": [_key_record(key) for key in sorted(duplicate_observe)],
+        "duplicate_edit_keys": [_key_record(key) for key in sorted(duplicate_edit)],
+        "unmatched_observe_keys": [_key_record(key) for key in sorted(unmatched_observe)],
+    }
+
+
+def compare_rows(observe_rows: list[dict[str, Any]], edit_rows: list[dict[str, Any]]) -> PairRows:
+    observe_counts = Counter(_key(row) for row in observe_rows)
+    edit_counts = Counter(_key(row) for row in edit_rows)
     observe_by_key: dict[tuple[Any, Any, Any], list[float]] = defaultdict(list)
     for row in observe_rows:
         rho = _numeric(row.get("rho_after"))
@@ -129,16 +169,22 @@ def compare_rows(observe_rows: list[dict[str, Any]], edit_rows: list[dict[str, A
     rows: list[dict[str, Any]] = []
     for row in edit_rows:
         key = _key(row)
+        observe_pair_count = observe_counts.get(key, 0)
+        edit_pair_count = edit_counts.get(key, 0)
         rho_observe = _mean(observe_by_key.get(key, []))
         rho_edit_after = _numeric(row.get("rho_after"))
         delta_vs_observe = None
         if rho_observe is not None and rho_edit_after is not None:
             delta_vs_observe = rho_edit_after - rho_observe
         rows.append({
-            "pair_status": "matched" if rho_observe is not None else "missing_observe",
+            "pair_status": "matched" if observe_pair_count > 0 else "missing_observe",
             "step_index": row.get("step_index"),
             "eligible_call_index": row.get("eligible_call_index"),
             "branch": row.get("branch"),
+            "observe_pair_count": observe_pair_count,
+            "edit_pair_count": edit_pair_count,
+            "observe_duplicate": observe_pair_count > 1,
+            "edit_duplicate": edit_pair_count > 1,
             "rho_observe": rho_observe,
             "rho_edit_before": _numeric(row.get("rho_before")),
             "rho_edit_after": rho_edit_after,
@@ -154,7 +200,7 @@ def compare_rows(observe_rows: list[dict[str, Any]], edit_rows: list[dict[str, A
             "diagnostic_batch_indices": row.get("diagnostic_batch_indices"),
             "selected_indices": row.get("selected_indices"),
         })
-    return rows
+    return PairRows(rows, _pair_analysis(observe_counts, edit_counts))
 
 
 def compare_files(
@@ -175,10 +221,24 @@ def summarize_rows(rows: list[dict[str, Any]], late_start_step: int | None = Non
     matched = [row for row in rows if row.get("pair_status") == "matched"]
     missing = [row for row in rows if row.get("pair_status") == "missing_observe"]
     edited = [row for row in rows if _boolish(row.get("edit_applied"))]
+    pair_analysis = getattr(rows, "pair_analysis", None)
+    if pair_analysis is None:
+        observe_duplicate_keys = {_key(row) for row in rows if _boolish(row.get("observe_duplicate"))}
+        edit_duplicate_keys = {_key(row) for row in rows if _boolish(row.get("edit_duplicate"))}
+        pair_analysis = {
+            "pair_key_columns": PAIR_KEY_COLUMNS,
+            "duplicate_observe_pairs": len(observe_duplicate_keys),
+            "duplicate_edit_pairs": len(edit_duplicate_keys),
+            "unmatched_observe_pairs": 0,
+            "duplicate_observe_keys": [_key_record(key) for key in sorted(observe_duplicate_keys)],
+            "duplicate_edit_keys": [_key_record(key) for key in sorted(edit_duplicate_keys)],
+            "unmatched_observe_keys": [],
+        }
     summary: dict[str, Any] = {
         "rows": len(rows),
         "matched": len(matched),
         "missing_observe": len(missing),
+        **pair_analysis,
         "overall": {
             "delta_rho_local_mean": _mean_field(rows, "delta_rho_local"),
             "delta_rho_vs_observe_mean": _mean_field(rows, "delta_rho_vs_observe"),
@@ -230,19 +290,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--summary", action="store_true", help="Emit JSON summary instead of rows.")
     parser.add_argument("--late-start-step", type=int, default=None, help="Start step for late-window summary.")
     parser.add_argument("--fail-on-missing-observe", action="store_true", help="Exit non-zero if any edit row lacks observe pair.")
+    parser.add_argument("--fail-on-duplicate-pairs", action="store_true", help="Exit non-zero if observe or edit duplicate pair keys exist.")
+    parser.add_argument("--fail-on-unmatched-observe", action="store_true", help="Exit non-zero if observe pair keys have no edit row.")
+    parser.add_argument("--allow-duplicate-average", action="store_true", help="Retain backward-compatible averaging of duplicate observe rows.")
     args = parser.parse_args(argv)
 
     rows = compare_files(args.observe_path, args.edit_path, input_format=args.input_format)
-    missing = any(row.get("pair_status") == "missing_observe" for row in rows)
+    summary = summarize_rows(rows, late_start_step=args.late_start_step)
     if args.summary:
-        json.dump(summarize_rows(rows, late_start_step=args.late_start_step), sys.stdout, indent=2)
+        json.dump(summary, sys.stdout, indent=2)
         sys.stdout.write("\n")
     elif args.format == "json":
         json.dump(rows, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         write_csv(rows, sys.stdout)
-    return 3 if missing and args.fail_on_missing_observe else 0
+    if args.fail_on_missing_observe and summary["missing_observe"] > 0:
+        return 3
+    if args.fail_on_duplicate_pairs and (
+        summary["duplicate_observe_pairs"] > 0 or summary["duplicate_edit_pairs"] > 0
+    ):
+        return 4
+    if args.fail_on_unmatched_observe and summary["unmatched_observe_pairs"] > 0:
+        return 5
+    return 0
 
 
 if __name__ == "__main__":

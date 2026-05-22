@@ -150,6 +150,7 @@ class StepStats:
     delta_rho: float | None = None
     max_estimated_logits_mib: float = 0.0
     max_estimated_peak_mib: float = 0.0
+    max_memory_estimate: dict[str, Any] | None = None
     eligible_call_metadata: dict[int, dict[str, Any]] = field(default_factory=dict)
     spectral_diagnostics: dict[str, SpectralDiagnostic] = field(default_factory=dict)
     spectral_diagnostic_records: list[tuple[int, SpectralDiagnostic]] = field(default_factory=list)
@@ -254,6 +255,41 @@ class LogitsBundle:
     gqa_info: GQAInfo
     estimated_logits_mib: float
     estimated_peak_mib: float
+    memory_estimate: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MemoryEstimate:
+    selected_batch: int
+    heads: int
+    query_len: int
+    text_len: int
+    bytes_per: int
+    logits_mib: float
+    fft_complex_mib: float
+    edited_spectrum_mib: float
+    restored_logits_mib: float
+    softmax_probs_mib: float
+    peak_multiplier: float
+    estimated_peak_mib: float
+    method: str = "conservative_full_fft_multiplier"
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "selected_batch": self.selected_batch,
+            "heads": self.heads,
+            "query_len": self.query_len,
+            "text_len": self.text_len,
+            "bytes_per": self.bytes_per,
+            "logits_mib": self.logits_mib,
+            "fft_complex_mib": self.fft_complex_mib,
+            "edited_spectrum_mib": self.edited_spectrum_mib,
+            "restored_logits_mib": self.restored_logits_mib,
+            "softmax_probs_mib": self.softmax_probs_mib,
+            "peak_multiplier": self.peak_multiplier,
+            "estimated_peak_mib": self.estimated_peak_mib,
+            "method": self.method,
+        }
 
 
 def infer_square_spatial_shape(query_len: int) -> tuple[int, int] | None:
@@ -465,6 +501,34 @@ def estimate_peak_mib(logits_mib: float, peak_multiplier: float = 4.0) -> float:
     return float(logits_mib) * peak_multiplier
 
 
+def estimate_attention_memory(
+    selected_batch: int,
+    heads: int,
+    query_len: int,
+    text_len: int,
+    bytes_per: int = 4,
+    peak_multiplier: float = 4.0,
+) -> MemoryEstimate:
+    logits_mib = estimate_logits_mib(selected_batch, heads, query_len, text_len, bytes_per)
+    complex_bytes = bytes_per * 2
+    fft_complex_mib = estimate_logits_mib(selected_batch, heads, query_len, text_len, complex_bytes)
+    estimated_peak_mib = estimate_peak_mib(logits_mib, peak_multiplier)
+    return MemoryEstimate(
+        selected_batch=int(selected_batch),
+        heads=int(heads),
+        query_len=int(query_len),
+        text_len=int(text_len),
+        bytes_per=int(bytes_per),
+        logits_mib=logits_mib,
+        fft_complex_mib=fft_complex_mib,
+        edited_spectrum_mib=fft_complex_mib,
+        restored_logits_mib=logits_mib,
+        softmax_probs_mib=logits_mib,
+        peak_multiplier=peak_multiplier,
+        estimated_peak_mib=estimated_peak_mib,
+    )
+
+
 def memory_estimate_record(logits_mib: float | None, peak_mib: float | None, peak_multiplier: float = 4.0) -> dict[str, Any] | None:
     if logits_mib is None or peak_mib is None:
         return None
@@ -472,7 +536,7 @@ def memory_estimate_record(logits_mib: float | None, peak_mib: float | None, pea
         "logits_mib": logits_mib,
         "peak_multiplier": peak_multiplier,
         "estimated_peak_mib": peak_mib,
-        "method": "conservative_full_fft",
+        "method": "conservative_full_fft_multiplier",
         "notes": (
             "Includes logits, edited/restored logits, softmax probabilities, and FFT spectrum "
             "as a coarse upper estimate."
@@ -722,8 +786,15 @@ class AnimaAFMAttentionOverride:
     def _diagnostic_call_selected(self, eligible_call_index: int) -> bool:
         return self._diagnostic_call_indices is None or eligible_call_index in self._diagnostic_call_indices
 
-    def _update_peak_estimate(self, step: StepStats, estimated_logits_mib: float) -> float:
+    def _update_peak_estimate(
+        self,
+        step: StepStats,
+        estimated_logits_mib: float,
+        memory_estimate: dict[str, Any] | None = None,
+    ) -> float:
         estimated_peak_mib = estimate_peak_mib(estimated_logits_mib)
+        if estimated_peak_mib >= step.max_estimated_peak_mib and memory_estimate is not None:
+            step.max_memory_estimate = memory_estimate
         step.max_estimated_logits_mib = max(step.max_estimated_logits_mib, estimated_logits_mib)
         step.max_estimated_peak_mib = max(step.max_estimated_peak_mib, estimated_peak_mib)
         return estimated_peak_mib
@@ -789,16 +860,24 @@ class AnimaAFMAttentionOverride:
         kwargs: dict[str, Any],
         transformer_options: dict[str, Any],
         progress: ProgressInfo,
+        eligible_call_index: int,
+        block_id: str,
         metadata: dict[str, Any],
     ) -> None:
         if self.stats.metadata_discovery_emitted or self.config.debug_level == "off":
             return
-        status = "found" if metadata else "not_found"
-        record = self._record_base("transformer_metadata_discovery", progress)
+        metadata_available = bool(metadata)
+        status = "found" if metadata_available else "not_found"
+        safe_options = self._summarize_transformer_options(transformer_options)
+        record = self._record_base("metadata_discovery", progress)
         record.update({
             "kwargs_keys": [str(key) for key in kwargs.keys()],
+            "transformer_option_keys": [str(key) for key in transformer_options.keys()],
             "transformer_options_keys": [str(key) for key in transformer_options.keys()],
-            "transformer_options_summary": self._summarize_transformer_options(transformer_options),
+            "safe_transformer_options": safe_options,
+            "transformer_options_summary": safe_options,
+            "eligible_call_to_block": {str(eligible_call_index): block_id},
+            "metadata_available": metadata_available,
             "metadata_status": status,
         })
         if status == "not_found":
@@ -854,7 +933,7 @@ class AnimaAFMAttentionOverride:
             "shape_counts": _counter_dict(step.shape_counts),
             "max_estimated_logits_mib": step.max_estimated_logits_mib,
             "max_peak_mib": step.max_estimated_peak_mib,
-            "memory_estimate": memory_estimate_record(step.max_estimated_logits_mib, step.max_estimated_peak_mib),
+            "memory_estimate": step.max_memory_estimate or memory_estimate_record(step.max_estimated_logits_mib, step.max_estimated_peak_mib),
             "max_logit_delta": step.max_logit_delta,
             "rho_before": None,
             "rho_after": None,
@@ -985,7 +1064,7 @@ class AnimaAFMAttentionOverride:
         step.shape_counts[shape_key(q, k)] += 1
         step.selected_counts[f"{int(selected.numel())}/{batch}"] += 1
         step.eligible_call_metadata[eligible_call_index] = {"block_id": block_id, **metadata}
-        self._maybe_log_metadata_discovery(kwargs, transformer_options, progress, metadata)
+        self._maybe_log_metadata_discovery(kwargs, transformer_options, progress, eligible_call_index, block_id, metadata)
 
         selected_indices = [int(index) for index in selected.detach().cpu().tolist()]
         return AttentionCallContext(
@@ -1041,8 +1120,14 @@ class AnimaAFMAttentionOverride:
     def _handle_observe_call(self, context: AttentionCallContext) -> torch.Tensor:
         self.stats.observed_calls += 1
         context.step.observed_calls += 1
-        estimated = estimate_logits_mib(int(context.selected.numel()), int(context.q.shape[1]), context.query_len, context.text_len)
-        estimated_peak = self._update_peak_estimate(context.step, estimated)
+        memory_estimate = estimate_attention_memory(
+            int(context.selected.numel()),
+            int(context.q.shape[1]),
+            context.query_len,
+            context.text_len,
+        ).to_record()
+        estimated = memory_estimate["logits_mib"]
+        estimated_peak = self._update_peak_estimate(context.step, estimated, memory_estimate)
         diagnostics = self._compute_passthrough_diagnostics(context, context.selected)
         self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
         out = context.original_func(*context.args, **context.kwargs)
@@ -1052,8 +1137,14 @@ class AnimaAFMAttentionOverride:
     def _handle_target_skipped_call(self, context: AttentionCallContext) -> torch.Tensor:
         self.stats.target_skipped_calls += 1
         context.step.target_skipped_calls += 1
-        estimated = estimate_logits_mib(int(context.selected.numel()), int(context.q.shape[1]), context.query_len, context.text_len)
-        estimated_peak = self._update_peak_estimate(context.step, estimated)
+        memory_estimate = estimate_attention_memory(
+            int(context.selected.numel()),
+            int(context.q.shape[1]),
+            context.query_len,
+            context.text_len,
+        ).to_record()
+        estimated = memory_estimate["logits_mib"]
+        estimated_peak = self._update_peak_estimate(context.step, estimated, memory_estimate)
         diagnostics = self._compute_passthrough_diagnostics(context, context.selected)
         self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
         out = context.original_func(*context.args, **context.kwargs)
@@ -1074,11 +1165,12 @@ class AnimaAFMAttentionOverride:
     def _compute_logits_bundle(self, context: AttentionCallContext) -> LogitsBundle:
         q_sel, k_sel, v_sel, _ = self._select_branch_tensors(context)
         q_sel, k_sel, v_sel, gqa_info = maybe_repeat_gqa(q_sel, k_sel, v_sel, context.kwargs)
-        estimated = estimate_logits_mib(int(q_sel.shape[0]), int(q_sel.shape[1]), int(q_sel.shape[-2]), int(k_sel.shape[-2]))
-        estimated_peak = self._update_peak_estimate(context.step, estimated)
+        memory_estimate = estimate_attention_memory(int(q_sel.shape[0]), int(q_sel.shape[1]), int(q_sel.shape[-2]), int(k_sel.shape[-2])).to_record()
+        estimated = memory_estimate["logits_mib"]
+        estimated_peak = self._update_peak_estimate(context.step, estimated, memory_estimate)
         self._enforce_memory_guards(context, q_sel, k_sel, estimated, estimated_peak)
         logits = torch.matmul(q_sel.float(), k_sel.float().transpose(-2, -1)) * context.scale
-        return LogitsBundle(q_sel, k_sel, v_sel, logits, gqa_info, estimated, estimated_peak)
+        return LogitsBundle(q_sel, k_sel, v_sel, logits, gqa_info, estimated, estimated_peak, memory_estimate)
 
     def _enforce_memory_guards(
         self,
@@ -1210,6 +1302,23 @@ class AnimaAFMAttentionOverride:
             block_id=context.block_id,
             metadata=context.metadata,
         )
+
+    def _memory_estimate_for_log(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        selected: torch.Tensor,
+        estimated_logits_mib: float | None,
+        estimated_peak_mib: float | None,
+    ) -> dict[str, Any] | None:
+        if estimated_logits_mib is None or estimated_peak_mib is None:
+            return None
+        return estimate_attention_memory(
+            int(selected.numel()),
+            int(q.shape[1]),
+            int(q.shape[-2]),
+            int(k.shape[-2]),
+        ).to_record()
 
     def _progress_from_kwargs(self, kwargs: dict[str, Any]) -> ProgressInfo | None:
         transformer_options = kwargs.get("transformer_options") or {}
@@ -1505,7 +1614,9 @@ class AnimaAFMAttentionOverride:
             },
             "estimated_logits_mib": estimated_logits_mib,
             "estimated_peak_mib": effective_peak_mib,
-            "memory_estimate": memory_estimate_record(estimated_logits_mib, effective_peak_mib),
+            "memory_estimate": self._memory_estimate_for_log(q, k, selected, estimated_logits_mib, effective_peak_mib)
+            if q is not None and k is not None and selected is not None
+            else step.max_memory_estimate or memory_estimate_record(estimated_logits_mib, effective_peak_mib),
             "max_estimated_logits_mib": step.max_estimated_logits_mib,
             "max_peak_mib": step.max_estimated_peak_mib,
             "target_call_indices": self.config.target_call_indices,
@@ -1585,7 +1696,7 @@ class AnimaAFMAttentionOverride:
             "attn_delta_max": diagnostic.attn_delta_max,
             "estimated_logits_mib": estimated_logits_mib,
             "estimated_peak_mib": estimated_peak_mib,
-            "memory_estimate": memory_estimate_record(estimated_logits_mib, estimated_peak_mib),
+            "memory_estimate": self._memory_estimate_for_log(q, k, selected, estimated_logits_mib, estimated_peak_mib),
         })
         self._emit_jsonl(record)
 
