@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import io
 
 import torch
 
@@ -18,8 +19,8 @@ from anima_afm import (
     schedule_alphas,
     selected_branch_indices,
 )
-from scripts.compare_afm_runs import compare_rows
-from scripts.parse_anima_afm_log import parse_records
+from scripts.compare_afm_runs import compare_rows, main as compare_main, read_rows, summarize_rows
+from scripts.parse_anima_afm_log import iter_json_records, parse_records, write_csv
 
 
 def reference_attention(q, k, v, heads, mask=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
@@ -117,10 +118,15 @@ class AnimaAFMTests(unittest.TestCase):
 
     def test_parse_call_index_scope_supports_all_lists_and_ranges(self):
         self.assertIsNone(parse_call_index_scope("all"))
+        self.assertEqual(parse_call_index_scope("0"), {0})
         self.assertEqual(parse_call_index_scope("0,7,14"), {0, 7, 14})
+        self.assertEqual(parse_call_index_scope("7-13"), {7, 8, 9, 10, 11, 12, 13})
+        self.assertEqual(parse_call_index_scope("0-0"), {0})
         self.assertEqual(parse_call_index_scope("0-2,7,10-11"), {0, 1, 2, 7, 10, 11})
-        with self.assertRaises(ValueError):
-            parse_call_index_scope("3-1")
+        for invalid in ("", "-1", "7-3", "a", "1,,2"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    parse_call_index_scope(invalid)
 
     def test_masks_have_expected_shape(self):
         low, high = radial_low_high_masks(8, 8, 0.25, True, 0.05, torch.device("cpu"), torch.float32)
@@ -335,15 +341,26 @@ class AnimaAFMTests(unittest.TestCase):
             override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
         records = self._json_log_records(logs.records)
         snapshot = [record for record in records if record["record_type"] == "step_snapshot"][0]
+        self.assertEqual(snapshot["schema_version"], 2)
         self.assertIsInstance(snapshot["estimated_peak_mib"], float)
         self.assertAlmostEqual(snapshot["estimated_peak_mib"], estimate_peak_mib(snapshot["estimated_logits_mib"]))
         self.assertEqual(snapshot["max_peak_mib"], snapshot["estimated_peak_mib"])
+        self.assertEqual(snapshot["memory_estimate"]["method"], "conservative_full_fft")
+        self.assertAlmostEqual(snapshot["memory_estimate"]["logits_mib"], snapshot["estimated_logits_mib"])
 
         original = CountingAttention()
         guarded = AnimaAFMAttentionOverride(AFMConfig(max_logits_mib=1024.0, max_peak_mib=0.0001))
         guarded(original, q, k, v, 2, **self._cfg_kwargs(0.5))
         self.assertEqual(original.calls, 1)
         self.assertEqual(guarded.stats.fallback_reasons["peak_vram_guard_exceeded"], 1)
+
+        raising = AnimaAFMAttentionOverride(AFMConfig(max_logits_mib=0.0001, fail_mode="raise"))
+        with self.assertRaises(RuntimeError):
+            raising(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+
+        raising_peak = AnimaAFMAttentionOverride(AFMConfig(max_logits_mib=1024.0, max_peak_mib=0.0001, fail_mode="raise"))
+        with self.assertRaises(RuntimeError):
+            raising_peak(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
 
     def test_target_call_indices_scope_edits_only_selected_calls(self):
         torch.manual_seed(260)
@@ -375,15 +392,15 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(final_summary["target_skipped"], 2)
         self.assertEqual(final_summary["target_call_indices"], "0")
 
-    def test_target_call_indices_range_scope(self):
+    def test_target_call_indices_range_scope_edits_seven_eligible_calls(self):
         q = torch.randn(2, 2, 16, 4)
         k = torch.randn(2, 2, 5, 4)
         v = torch.randn(2, 2, 5, 4)
-        override = AnimaAFMAttentionOverride(AFMConfig(target_call_indices="0-1"))
-        for _ in range(3):
+        override = AnimaAFMAttentionOverride(AFMConfig(target_call_indices="0-6"))
+        for _ in range(8):
             override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
         step = override.stats.steps[1]
-        self.assertEqual(step.edited_calls, 2)
+        self.assertEqual(step.edited_calls, 7)
         self.assertEqual(step.target_skipped_calls, 1)
 
     def test_spectral_diag_reports_rho_delta(self):
@@ -486,6 +503,17 @@ class AnimaAFMTests(unittest.TestCase):
         spectral = [record for record in records if record["record_type"] == "spectral_diag"]
         by_branch = {record["diagnostic_branch"]: record for record in spectral}
         self.assertEqual(set(by_branch), {"negative", "positive"})
+        self.assertEqual(by_branch["positive"]["schema_version"], 2)
+        self.assertEqual(by_branch["positive"]["call_mode"], "edit")
+        self.assertEqual(by_branch["positive"]["diagnostic_mode"], "edited")
+        self.assertEqual(by_branch["positive"]["edit_selected_indices"], [1])
+        self.assertEqual(by_branch["positive"]["diagnostic_batch_indices"], [1])
+        self.assertEqual(by_branch["positive"]["selected_indices"], [1])
+        self.assertEqual(by_branch["positive"]["batch_indices"], [1])
+        self.assertEqual(by_branch["negative"]["call_mode"], "edit")
+        self.assertEqual(by_branch["negative"]["diagnostic_mode"], "passthrough")
+        self.assertEqual(by_branch["negative"]["edit_selected_indices"], [1])
+        self.assertEqual(by_branch["negative"]["diagnostic_batch_indices"], [0])
         self.assertFalse(by_branch["negative"]["edit_applied"])
         self.assertTrue(by_branch["positive"]["edit_applied"])
         self.assertEqual(by_branch["negative"]["rho_before"], by_branch["negative"]["rho_after"])
@@ -515,6 +543,8 @@ class AnimaAFMTests(unittest.TestCase):
         by_branch = {record["diagnostic_branch"]: record for record in spectral}
         self.assertEqual(set(by_branch), {"negative", "positive"})
         self.assertEqual({record["mode"] for record in spectral}, {"observe"})
+        self.assertEqual({record["call_mode"] for record in spectral}, {"observe"})
+        self.assertEqual({record["diagnostic_mode"] for record in spectral}, {"observe"})
         self.assertTrue(all(record["rho_before"] == record["rho_after"] for record in spectral))
         self.assertTrue(all(record["delta_rho_local"] == 0.0 for record in spectral))
         self.assertEqual(override.stats.edited_calls, 0)
@@ -618,6 +648,7 @@ class AnimaAFMTests(unittest.TestCase):
             override.finalize()
         records = self._json_log_records(logs.records)
         run_summary = [record for record in records if record["record_type"] == "run_final_summary"][0]
+        self.assertEqual(run_summary["schema_version"], 2)
         self.assertEqual(run_summary["last_step_index"], 1)
         self.assertEqual(run_summary["steps"]["1"]["eligible"], 1)
         self.assertEqual(run_summary["steps"]["1"]["eligible_call_indices"], {"0": 1})
@@ -639,6 +670,12 @@ class AnimaAFMTests(unittest.TestCase):
             override(reference_attention, q, k, v, 2, **kwargs)
         records = self._json_log_records(logs.records)
         snapshots = [record for record in records if record["record_type"] == "step_snapshot"]
+        discovery = [record for record in records if record["record_type"] == "transformer_metadata_discovery"]
+        self.assertEqual(len(discovery), 1)
+        self.assertEqual(discovery[0]["schema_version"], 2)
+        self.assertEqual(discovery[0]["metadata_status"], "found")
+        self.assertIn("transformer_options_keys", discovery[0])
+        self.assertIn("block", discovery[0]["transformer_options_summary"])
         self.assertEqual([record["eligible_call_index"] for record in snapshots], [0, 1])
         self.assertEqual(snapshots[0]["block_id"], "input:7")
         self.assertEqual(snapshots[0]["metadata"]["module_path"], "diffusion_model.blocks.7.attn")
@@ -652,6 +689,8 @@ class AnimaAFMTests(unittest.TestCase):
             override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
         records = self._json_log_records(logs.records)
         snapshot = [record for record in records if record["record_type"] == "step_snapshot"][0]
+        discovery = [record for record in records if record["record_type"] == "transformer_metadata_discovery"][0]
+        self.assertEqual(discovery["metadata_status"], "not_found")
         self.assertEqual(snapshot["block_id"], "unknown")
         self.assertEqual(snapshot["metadata"], {})
 
@@ -718,8 +757,14 @@ class AnimaAFMTests(unittest.TestCase):
     def test_parser_and_compare_rows_emit_observe_vs_edit_trajectory_fields(self):
         observe_records = [
             {
+                "schema_version": 1,
                 "record_type": "spectral_diag",
+                "run_id": "observe",
                 "step_index": 1,
+                "num_steps": 2,
+                "last_index": 1,
+                "u": 1.0,
+                "sigma": 0.5,
                 "eligible_call_index": 7,
                 "diagnostic_branch": "positive",
                 "mode": "observe",
@@ -735,10 +780,22 @@ class AnimaAFMTests(unittest.TestCase):
         ]
         edit_records = [
             {
+                "schema_version": 2,
                 "record_type": "spectral_diag",
+                "run_id": "edit",
                 "step_index": 1,
+                "num_steps": 2,
+                "last_index": 1,
+                "u": 1.0,
+                "sigma": 0.5,
                 "eligible_call_index": 7,
+                "target_call_indices": "7-13",
+                "diagnostic_call_indices": "0,7",
+                "target_call_selected": True,
+                "diagnostic_call_selected": True,
                 "diagnostic_branch": "positive",
+                "call_mode": "edit",
+                "diagnostic_mode": "edited",
                 "mode": "edit",
                 "rho_before": 0.21,
                 "rho_after": 0.27,
@@ -746,20 +803,111 @@ class AnimaAFMTests(unittest.TestCase):
                 "delta_rho_local": 0.06,
                 "alpha_lf": 1.0,
                 "alpha_hf": 1.1,
-                "selected_indices": [1],
+                "edit_selected_indices": [1],
+                "diagnostic_batch_indices": [1],
                 "edit_applied": True,
             }
         ]
         observe_rows = parse_records(observe_records)
         edit_rows = parse_records(edit_records)
+        self.assertEqual(observe_rows[0]["schema_version"], 1)
         self.assertEqual(observe_rows[0]["branch"], "positive")
+        self.assertEqual(observe_rows[0]["call_mode"], "observe")
+        self.assertEqual(observe_rows[0]["diagnostic_mode"], "observe")
         self.assertEqual(observe_rows[0]["selected_indices"], "[1]")
+        self.assertEqual(edit_rows[0]["edit_selected_indices"], "[1]")
+        self.assertEqual(edit_rows[0]["diagnostic_batch_indices"], "[1]")
+
+        csv_out = io.StringIO()
+        write_csv(edit_rows, csv_out)
+        self.assertIn("schema_version,record_type,run_id", csv_out.getvalue().splitlines()[0])
+        self.assertIn("diagnostic_batch_indices", csv_out.getvalue().splitlines()[0])
 
         comparison = compare_rows(observe_rows, edit_rows)
+        self.assertEqual(comparison[0]["pair_status"], "matched")
         self.assertEqual(comparison[0]["step_index"], 1)
         self.assertEqual(comparison[0]["eligible_call_index"], 7)
+        self.assertAlmostEqual(comparison[0]["rho_edit_before"], 0.21)
         self.assertAlmostEqual(comparison[0]["delta_rho_local"], 0.06)
         self.assertAlmostEqual(comparison[0]["delta_rho_vs_observe"], 0.07)
+        self.assertEqual(comparison[0]["diagnostic_mode"], "edited")
+
+    def test_parser_skips_malformed_json_unless_strict(self):
+        lines = [
+            '{"record_type":"spectral_diag","step_index":0,"eligible_call_index":0,"diagnostic_branch":"positive"}\n',
+            '{bad json}\n',
+            '["not", "a", "record"]\n',
+            '\n',
+        ]
+        self.assertEqual(len(list(iter_json_records(lines))), 1)
+        with self.assertRaises(json.JSONDecodeError):
+            list(iter_json_records(lines, strict=True))
+
+    def test_compare_detects_missing_observe_and_summarizes(self):
+        edit_rows = parse_records([
+            {
+                "schema_version": 2,
+                "record_type": "spectral_diag",
+                "step_index": 16,
+                "eligible_call_index": 7,
+                "diagnostic_branch": "positive",
+                "call_mode": "edit",
+                "diagnostic_mode": "edited",
+                "rho_before": 0.21,
+                "rho_after": 0.27,
+                "delta_rho_local": 0.06,
+                "edit_applied": True,
+            }
+        ])
+        rows = compare_rows([], edit_rows)
+        self.assertEqual(rows[0]["pair_status"], "missing_observe")
+        summary = summarize_rows(rows, late_start_step=16)
+        self.assertEqual(summary["rows"], 1)
+        self.assertEqual(summary["missing_observe"], 1)
+        self.assertEqual(summary["late_window"]["start_step"], 16)
+
+        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+            observe_path = Path(temp_dir) / "observe.jsonl"
+            edit_path = Path(temp_dir) / "edit.jsonl"
+            observe_path.write_text("", encoding="utf-8")
+            edit_path.write_text(json.dumps({
+                "record_type": "spectral_diag",
+                "step_index": 16,
+                "eligible_call_index": 7,
+                "diagnostic_branch": "positive",
+                "rho_after": 0.27,
+            }) + "\n", encoding="utf-8")
+            self.assertEqual(compare_main([str(observe_path), str(edit_path), "--fail-on-missing-observe"]), 3)
+
+    def test_compare_reads_csv_and_jsonl_inputs(self):
+        observe_record = {
+            "record_type": "spectral_diag",
+            "step_index": 0,
+            "eligible_call_index": 0,
+            "diagnostic_branch": "positive",
+            "mode": "observe",
+            "rho_after": 0.2,
+        }
+        edit_record = {
+            "record_type": "spectral_diag",
+            "step_index": 0,
+            "eligible_call_index": 0,
+            "diagnostic_branch": "positive",
+            "mode": "edit",
+            "rho_before": 0.2,
+            "rho_after": 0.25,
+            "delta_rho_local": 0.05,
+        }
+        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+            jsonl_path = Path(temp_dir) / "observe.jsonl"
+            csv_path = Path(temp_dir) / "edit.csv"
+            jsonl_path.write_text(json.dumps(observe_record) + "\n", encoding="utf-8")
+            edit_rows = parse_records([edit_record])
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                write_csv(edit_rows, handle)
+
+            self.assertEqual(len(read_rows(jsonl_path, input_format="jsonl")), 1)
+            self.assertEqual(len(read_rows(csv_path, input_format="csv")), 1)
 
     def test_self_attention_falls_back(self):
         torch.manual_seed(3)

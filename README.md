@@ -39,9 +39,72 @@ alpha_lf=1.0000 alpha_hf=1.2000
 
 Set `target_call_indices=all`, a comma list such as `0,7,14`, or a range such as `7-13` to scope editing by stable per-step eligible call index. Calls outside the target scope return the original attention output and are counted as `target_skipped`, not fallbacks.
 
-Set `debug_format=jsonl` or `both` for machine-readable records. Set `jsonl_path` to also append those records to a JSONL file while preserving logger output. JSONL spectral diagnostics include separate `negative` and `positive` records when `cond_or_uncond=[1, 0]` and `diagnostic_branch=both_separate`. Use `diagnostic_call_indices=all`, comma lists, or ranges plus `diagnostic_every_n_steps` to limit spectral work while preserving stable `eligible_call_index` identities. In `positive_only` or `negative_only`, set `diagnostic_include_unselected=true` to emit passthrough spectral diagnostics for the unedited CFG branch without changing the output.
+Set `debug_format=jsonl` or `both` for machine-readable records. Set `jsonl_path` to also append those records to a JSONL file while preserving logger output. JSONL records now use `schema_version=2`. Spectral diagnostics include separate `negative` and `positive` records when `cond_or_uncond=[1, 0]` and `diagnostic_branch=both_separate`. Use `diagnostic_call_indices=all`, comma lists, or ranges plus `diagnostic_every_n_steps` to limit spectral work while preserving stable `eligible_call_index` identities. `target_call_indices` and `diagnostic_call_indices` are independent: the former controls edited calls, the latter controls diagnostic work. In `positive_only` or `negative_only`, set `diagnostic_include_unselected=true` to emit passthrough spectral diagnostics for the unedited CFG branch without changing the output.
 
-Use `scripts/parse_anima_afm_log.py` to extract spectral diagnostic rows from JSONL, and `scripts/compare_afm_runs.py` to compare observe-vs-edit rho trajectories by `step_index`, `eligible_call_index`, and branch.
+Schema v2 separates fields that were ambiguous in earlier logs:
+
+- `call_mode` is the whole attention call behavior: `edit`, `observe`, `passthrough`, or `off`. Legacy `mode` remains as a compatibility alias.
+- `diagnostic_mode` is the measured branch behavior: `edited`, `observe`, `passthrough`, or `target_skipped`.
+- `edit_selected_indices` is the batch slice eligible for editing. Legacy `selected_indices` remains as its alias.
+- `diagnostic_batch_indices` is the batch slice measured by that spectral row. Legacy `batch_indices` remains as its alias.
+- `edit_applied=false` on an unselected branch means the branch was measured, not edited.
+- `rho` is the high-frequency ratio of a post-softmax top-K concentration map. It is not a direct image-frequency measurement.
+- `delta_rho_local = rho_after - rho_before` within one run. `delta_rho_vs_observe = rho_edit_after - rho_observe` is produced by compare against an observe baseline.
+
+Use `scripts/parse_anima_afm_log.py` to extract spectral diagnostic rows from JSONL, and `scripts/compare_afm_runs.py` to compare observe-vs-edit rho trajectories by `step_index`, `eligible_call_index`, and branch. Both scripts keep legacy v1 JSONL/CSV compatibility.
+
+```bash
+python scripts/parse_anima_afm_log.py logs/observe.jsonl --format csv > out/observe.csv
+python scripts/parse_anima_afm_log.py logs/edit.jsonl --format csv > out/edit.csv
+python scripts/compare_afm_runs.py logs/observe.jsonl logs/edit.jsonl --format csv > out/compare.csv
+python scripts/compare_afm_runs.py out/observe.csv out/edit.csv --input-format csv --summary --late-start-step 16 --format json
+```
+
+## Next Logs
+
+Collect these with the same seed, prompt, sampler, and latent:
+
+```text
+A. observe baseline
+mode=observe
+strength=0.0
+branch_mode=both
+spectral_diag=sampled
+diagnostic_branch=both_separate
+diagnostic_call_indices=0,7,14,21,27
+debug_format=both
+
+B. call0 edit
+mode=edit
+strength=0.1
+branch_mode=both
+target_call_indices=0
+spectral_diag=sampled
+diagnostic_branch=both_separate
+diagnostic_call_indices=0,7,14,21,27
+debug_format=both
+
+C. call7-13 edit
+mode=edit
+strength=0.1
+branch_mode=both
+target_call_indices=7-13
+spectral_diag=sampled
+diagnostic_branch=both_separate
+diagnostic_call_indices=0,7,14,21,27
+debug_format=both
+
+D. positive-only preservation diagnostic
+mode=edit
+strength=0.1
+branch_mode=positive_only
+target_call_indices=all
+diagnostic_include_unselected=true
+spectral_diag=sampled
+diagnostic_branch=both_separate
+diagnostic_call_indices=0,7,14,21,27
+debug_format=both
+```
 
 ## Limits
 

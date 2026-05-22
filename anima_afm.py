@@ -179,6 +179,7 @@ class AFMRuntimeStats:
     active_step_index: int | None = None
     expected_total_calls_per_step: int | None = None
     run_final_summary_emitted: bool = False
+    metadata_discovery_emitted: bool = False
     verbose_fallback_counts_by_step_reason: dict[tuple[int, str], int] = field(default_factory=dict)
 
     def step_for(self, progress: "ProgressInfo") -> StepStats:
@@ -214,6 +215,45 @@ class ProgressInfo:
     @property
     def total(self) -> int:
         return self.num_steps
+
+
+@dataclass(frozen=True)
+class AttentionCallContext:
+    original_func: Callable
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    heads: int
+    scale: float
+    transformer_options: dict[str, Any]
+    progress: ProgressInfo
+    step: StepStats
+    batch: int
+    query_len: int
+    text_len: int
+    spatial_shape: tuple[int, int]
+    cond_or_uncond: list[int] | None
+    selected: torch.Tensor
+    selected_indices: list[int]
+    eligible_call_index: int
+    block_id: str
+    metadata: dict[str, Any]
+    target_call_selected: bool
+    diagnostic_call_selected: bool
+    active_mode: str
+
+
+@dataclass(frozen=True)
+class LogitsBundle:
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    logits: torch.Tensor
+    gqa_info: GQAInfo
+    estimated_logits_mib: float
+    estimated_peak_mib: float
 
 
 def infer_square_spatial_shape(query_len: int) -> tuple[int, int] | None:
@@ -423,6 +463,21 @@ def estimate_logits_mib(batch: int, heads: int, query_len: int, text_len: int, b
 
 def estimate_peak_mib(logits_mib: float, peak_multiplier: float = 4.0) -> float:
     return float(logits_mib) * peak_multiplier
+
+
+def memory_estimate_record(logits_mib: float | None, peak_mib: float | None, peak_multiplier: float = 4.0) -> dict[str, Any] | None:
+    if logits_mib is None or peak_mib is None:
+        return None
+    return {
+        "logits_mib": logits_mib,
+        "peak_multiplier": peak_multiplier,
+        "estimated_peak_mib": peak_mib,
+        "method": "conservative_full_fft",
+        "notes": (
+            "Includes logits, edited/restored logits, softmax probabilities, and FFT spectrum "
+            "as a coarse upper estimate."
+        ),
+    }
 
 
 class AFMFallback(RuntimeError):
@@ -664,6 +719,9 @@ class AnimaAFMAttentionOverride:
     def _target_call_selected(self, eligible_call_index: int) -> bool:
         return self._target_call_indices is None or eligible_call_index in self._target_call_indices
 
+    def _diagnostic_call_selected(self, eligible_call_index: int) -> bool:
+        return self._diagnostic_call_indices is None or eligible_call_index in self._diagnostic_call_indices
+
     def _update_peak_estimate(self, step: StepStats, estimated_logits_mib: float) -> float:
         estimated_peak_mib = estimate_peak_mib(estimated_logits_mib)
         step.max_estimated_logits_mib = max(step.max_estimated_logits_mib, estimated_logits_mib)
@@ -706,6 +764,7 @@ class AnimaAFMAttentionOverride:
 
     def _record_base(self, record_type: str, progress: ProgressInfo | None) -> dict[str, Any]:
         record: dict[str, Any] = {
+            "schema_version": 2,
             "record_type": record_type,
             "run_id": self.run_id,
         }
@@ -718,6 +777,34 @@ class AnimaAFMAttentionOverride:
                 "sigma": progress.sigma,
             })
         return record
+
+    def _summarize_transformer_options(self, transformer_options: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        for key in list(transformer_options.keys())[:24]:
+            summary[str(key)] = _safe_metadata_value(transformer_options[key])
+        return summary
+
+    def _maybe_log_metadata_discovery(
+        self,
+        kwargs: dict[str, Any],
+        transformer_options: dict[str, Any],
+        progress: ProgressInfo,
+        metadata: dict[str, Any],
+    ) -> None:
+        if self.stats.metadata_discovery_emitted or self.config.debug_level == "off":
+            return
+        status = "found" if metadata else "not_found"
+        record = self._record_base("transformer_metadata_discovery", progress)
+        record.update({
+            "kwargs_keys": [str(key) for key in kwargs.keys()],
+            "transformer_options_keys": [str(key) for key in transformer_options.keys()],
+            "transformer_options_summary": self._summarize_transformer_options(transformer_options),
+            "metadata_status": status,
+        })
+        if status == "not_found":
+            record["message"] = "No useful transformer block/module identity found; call-index targeting remains primary."
+        self._emit_jsonl(record)
+        self.stats.metadata_discovery_emitted = True
 
     def _spectral_summary(self, step: StepStats) -> dict[str, Any]:
         records = step.spectral_diagnostic_records
@@ -767,6 +854,7 @@ class AnimaAFMAttentionOverride:
             "shape_counts": _counter_dict(step.shape_counts),
             "max_estimated_logits_mib": step.max_estimated_logits_mib,
             "max_peak_mib": step.max_estimated_peak_mib,
+            "memory_estimate": memory_estimate_record(step.max_estimated_logits_mib, step.max_estimated_peak_mib),
             "max_logit_delta": step.max_logit_delta,
             "rho_before": None,
             "rho_after": None,
@@ -823,58 +911,71 @@ class AnimaAFMAttentionOverride:
         return result
 
     def _call(self, original_func: Callable, *args: Any, **kwargs: Any) -> torch.Tensor:
-        if self.config.mode == "off":
+        if self._handle_off_or_zero_original():
             return original_func(*args, **kwargs)
-        if (
+
+        try:
+            context = self._prepare_context(original_func, args, kwargs)
+        except AFMFallback as exc:
+            progress = self._progress_from_kwargs(kwargs)
+            return self._fallback(original_func, exc.reason, *args, progress=progress, **kwargs)
+
+        if context.active_mode == "observe":
+            return self._handle_observe_call(context)
+        if not context.target_call_selected:
+            return self._handle_target_skipped_call(context)
+        return self._handle_edit_call(context)
+
+    def _handle_off_or_zero_original(self) -> bool:
+        return self.config.mode == "off" or (
             self.config.mode == "edit"
             and abs(float(self.config.strength)) == 0.0
             and self.config.zero_strength_mode == "original"
-        ):
-            return original_func(*args, **kwargs)
+        )
 
+    def _extract_raw_attention_args(self, args: tuple[Any, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if len(args) < 4:
-            return self._fallback(original_func, "bad_rank", *args, **kwargs)
-
+            raise AFMFallback("bad_rank")
         q, k, v, heads = args[:4]
+        if not all(torch.is_tensor(t) and t.ndim == 4 for t in (q, k, v)):
+            raise AFMFallback("bad_rank")
+        return q, k, v, int(heads)
+
+    def _prepare_context(self, original_func: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]) -> AttentionCallContext:
+        q, k, v, heads = self._extract_raw_attention_args(args)
         transformer_options = kwargs.get("transformer_options") or {}
         progress = progress_from_sigmas(transformer_options)
         if progress is not None:
             self._step_for(progress).total_calls += 1
-
         if len(args) > 4 and args[4] is not None:
-            return self._fallback(original_func, "mask_shape_unsupported", *args, progress=progress, **kwargs)
+            raise AFMFallback("mask_shape_unsupported")
         if kwargs.get("mask") is not None:
-            return self._fallback(original_func, "mask_shape_unsupported", *args, progress=progress, **kwargs)
+            raise AFMFallback("mask_shape_unsupported")
         if not kwargs.get("skip_reshape", False):
-            return self._fallback(original_func, "not_skip_reshape", *args, progress=progress, **kwargs)
-        if not all(torch.is_tensor(t) and t.ndim == 4 for t in (q, k, v)):
-            return self._fallback(original_func, "bad_rank", *args, progress=progress, **kwargs)
+            raise AFMFallback("not_skip_reshape")
 
         query_len = int(q.shape[-2])
         text_len = int(k.shape[-2])
         if query_len == text_len:
-            return self._fallback(original_func, "not_cross_attention", *args, progress=progress, **kwargs)
-
+            raise AFMFallback("not_cross_attention")
         spatial_shape = infer_square_spatial_shape(query_len)
         if spatial_shape is None:
-            return self._fallback(original_func, "cannot_infer_spatial_shape", *args, progress=progress, **kwargs)
-
+            raise AFMFallback("cannot_infer_spatial_shape")
         if progress is None:
-            return self._fallback(original_func, "missing_sigmas", *args, progress=None, **kwargs)
+            raise AFMFallback("missing_sigmas")
         if progress.progress < self.config.start_percent or progress.progress > self.config.end_percent:
-            return self._fallback(original_func, "progress_outside_window", *args, progress=progress, **kwargs)
+            raise AFMFallback("progress_outside_window")
 
         batch = int(q.shape[0])
         cond_or_uncond = transformer_options.get("cond_or_uncond")
         selected = selected_branch_indices(batch, cond_or_uncond, self.config.branch_mode, q.device)
         if selected.numel() == 0:
             reason = "branch_layout_unknown" if self.config.branch_mode != "both" and not cond_or_uncond else "branch_not_selected"
-            return self._fallback(original_func, reason, *args, progress=progress, **kwargs)
+            raise AFMFallback(reason)
 
         active_mode = self.config.mode
-        if active_mode == "edit" and abs(float(self.config.strength)) == 0.0:
-            if self.config.zero_strength_mode == "observe":
-                active_mode = "observe"
+        if active_mode == "edit" and abs(float(self.config.strength)) == 0.0 and self.config.zero_strength_mode == "observe":
+            active_mode = "observe"
 
         step = self._step_for(progress)
         eligible_call_index = step.eligible_calls
@@ -884,122 +985,109 @@ class AnimaAFMAttentionOverride:
         step.shape_counts[shape_key(q, k)] += 1
         step.selected_counts[f"{int(selected.numel())}/{batch}"] += 1
         step.eligible_call_metadata[eligible_call_index] = {"block_id": block_id, **metadata}
+        self._maybe_log_metadata_discovery(kwargs, transformer_options, progress, metadata)
 
-        if active_mode == "observe":
-            self.stats.observed_calls += 1
-            step.observed_calls += 1
-            estimated = estimate_logits_mib(int(selected.numel()), int(q.shape[1]), query_len, text_len)
-            estimated_peak = self._update_peak_estimate(step, estimated)
-            diagnostics: list[SpectralDiagnostic] = []
-            if self._should_run_spectral_diag(progress, eligible_call_index):
-                scale = kwargs.get("scale", q.shape[-1] ** -0.5)
-                q_diag = q if int(selected.numel()) == batch else q.index_select(0, selected)
-                k_diag = k if int(selected.numel()) == batch else k.index_select(0, selected)
-                v_diag = v if int(selected.numel()) == batch else v.index_select(0, selected)
-                try:
-                    q_diag, k_diag, v_diag, _ = maybe_repeat_gqa(q_diag, k_diag, v_diag, kwargs)
-                    logits = torch.matmul(q_diag.float(), k_diag.float().transpose(-2, -1)) * float(scale)
-                    diagnostics = sampled_spectral_diagnostics(
-                        logits,
-                        logits,
-                        spatial_shape,
-                        self.config,
-                        selected,
-                        batch,
-                        cond_or_uncond,
-                        edit_applied=False,
-                    )
-                    self._record_spectral_diagnostics(step, eligible_call_index, diagnostics)
-                except AFMFallback:
-                    diagnostics = []
-            out = original_func(*args, **kwargs)
-            self._log_eligible(
-                mode="observe",
-                progress=progress,
-                q=q,
-                k=k,
-                v=v,
-                spatial_shape=spatial_shape,
-                alpha_lf=None,
-                alpha_hf=None,
-                entropy_value=None,
-                selected=selected,
-                cond_or_uncond=cond_or_uncond,
-                gqa_info=None,
-                estimated_logits_mib=estimated,
-                estimated_peak_mib=estimated_peak,
-                logits_delta=None,
-                diagnostics=diagnostics,
-                eligible_call_index=eligible_call_index,
-                block_id=block_id,
-                metadata=metadata,
-            )
-            return out
+        selected_indices = [int(index) for index in selected.detach().cpu().tolist()]
+        return AttentionCallContext(
+            original_func=original_func,
+            args=args,
+            kwargs=kwargs,
+            q=q,
+            k=k,
+            v=v,
+            heads=heads,
+            scale=float(kwargs.get("scale", q.shape[-1] ** -0.5)),
+            transformer_options=transformer_options,
+            progress=progress,
+            step=step,
+            batch=batch,
+            query_len=query_len,
+            text_len=text_len,
+            spatial_shape=spatial_shape,
+            cond_or_uncond=cond_or_uncond,
+            selected=selected,
+            selected_indices=selected_indices,
+            eligible_call_index=eligible_call_index,
+            block_id=block_id,
+            metadata=metadata,
+            target_call_selected=self._target_call_selected(eligible_call_index),
+            diagnostic_call_selected=self._diagnostic_call_selected(eligible_call_index),
+            active_mode=active_mode,
+        )
 
-        if not self._target_call_selected(eligible_call_index):
-            self.stats.target_skipped_calls += 1
-            step.target_skipped_calls += 1
-            estimated = estimate_logits_mib(int(selected.numel()), int(q.shape[1]), query_len, text_len)
-            estimated_peak = self._update_peak_estimate(step, estimated)
-            diagnostics: list[SpectralDiagnostic] = []
-            if self._should_run_spectral_diag(progress, eligible_call_index):
-                scale = kwargs.get("scale", q.shape[-1] ** -0.5)
-                q_diag = q if int(selected.numel()) == batch else q.index_select(0, selected)
-                k_diag = k if int(selected.numel()) == batch else k.index_select(0, selected)
-                v_diag = v if int(selected.numel()) == batch else v.index_select(0, selected)
-                try:
-                    q_diag, k_diag, v_diag, _ = maybe_repeat_gqa(q_diag, k_diag, v_diag, kwargs)
-                    logits = torch.matmul(q_diag.float(), k_diag.float().transpose(-2, -1)) * float(scale)
-                    diagnostics = sampled_spectral_diagnostics(
-                        logits,
-                        logits,
-                        spatial_shape,
-                        self.config,
-                        selected,
-                        batch,
-                        cond_or_uncond,
-                        edit_applied=False,
-                    )
-                    self._record_spectral_diagnostics(step, eligible_call_index, diagnostics)
-                except AFMFallback:
-                    diagnostics = []
-            out = original_func(*args, **kwargs)
-            self._log_eligible(
-                mode="passthrough",
-                progress=progress,
-                q=q,
-                k=k,
-                v=v,
-                spatial_shape=spatial_shape,
-                alpha_lf=None,
-                alpha_hf=None,
-                entropy_value=None,
-                selected=selected,
-                cond_or_uncond=cond_or_uncond,
-                gqa_info=None,
-                estimated_logits_mib=estimated,
-                estimated_peak_mib=estimated_peak,
-                logits_delta=None,
-                diagnostics=diagnostics,
-                eligible_call_index=eligible_call_index,
-                block_id=block_id,
-                metadata=metadata,
-            )
-            return out
-
-        scale = kwargs.get("scale", q.shape[-1] ** -0.5)
-        all_selected = int(selected.numel()) == batch
-        q_sel = q if all_selected else q.index_select(0, selected)
-        k_sel = k if all_selected else k.index_select(0, selected)
-        v_sel = v if all_selected else v.index_select(0, selected)
-
+    def _compute_passthrough_diagnostics(self, context: AttentionCallContext, selected: torch.Tensor) -> list[SpectralDiagnostic]:
+        if not self._should_run_spectral_diag(context.progress, context.eligible_call_index):
+            return []
+        all_selected = int(selected.numel()) == context.batch
+        q_diag = context.q if all_selected else context.q.index_select(0, selected)
+        k_diag = context.k if all_selected else context.k.index_select(0, selected)
+        v_diag = context.v if all_selected else context.v.index_select(0, selected)
         try:
-            q_sel, k_sel, v_sel, gqa_info = maybe_repeat_gqa(q_sel, k_sel, v_sel, kwargs)
-        except AFMFallback as exc:
-            return self._fallback(original_func, exc.reason, *args, progress=progress, **kwargs)
+            q_diag, k_diag, v_diag, _ = maybe_repeat_gqa(q_diag, k_diag, v_diag, context.kwargs)
+            logits = torch.matmul(q_diag.float(), k_diag.float().transpose(-2, -1)) * context.scale
+        except AFMFallback:
+            return []
+        return sampled_spectral_diagnostics(
+            logits,
+            logits,
+            context.spatial_shape,
+            self.config,
+            selected,
+            context.batch,
+            context.cond_or_uncond,
+            edit_applied=False,
+        )
 
+    def _handle_observe_call(self, context: AttentionCallContext) -> torch.Tensor:
+        self.stats.observed_calls += 1
+        context.step.observed_calls += 1
+        estimated = estimate_logits_mib(int(context.selected.numel()), int(context.q.shape[1]), context.query_len, context.text_len)
+        estimated_peak = self._update_peak_estimate(context.step, estimated)
+        diagnostics = self._compute_passthrough_diagnostics(context, context.selected)
+        self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
+        out = context.original_func(*context.args, **context.kwargs)
+        self._log_eligible_from_context(context, "observe", None, None, None, None, estimated, estimated_peak, None, diagnostics)
+        return out
+
+    def _handle_target_skipped_call(self, context: AttentionCallContext) -> torch.Tensor:
+        self.stats.target_skipped_calls += 1
+        context.step.target_skipped_calls += 1
+        estimated = estimate_logits_mib(int(context.selected.numel()), int(context.q.shape[1]), context.query_len, context.text_len)
+        estimated_peak = self._update_peak_estimate(context.step, estimated)
+        diagnostics = self._compute_passthrough_diagnostics(context, context.selected)
+        self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
+        out = context.original_func(*context.args, **context.kwargs)
+        self._log_eligible_from_context(context, "passthrough", None, None, None, None, estimated, estimated_peak, None, diagnostics)
+        return out
+
+    def _select_branch_tensors(self, context: AttentionCallContext) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        all_selected = int(context.selected.numel()) == context.batch
+        if all_selected:
+            return context.q, context.k, context.v, True
+        return (
+            context.q.index_select(0, context.selected),
+            context.k.index_select(0, context.selected),
+            context.v.index_select(0, context.selected),
+            False,
+        )
+
+    def _compute_logits_bundle(self, context: AttentionCallContext) -> LogitsBundle:
+        q_sel, k_sel, v_sel, _ = self._select_branch_tensors(context)
+        q_sel, k_sel, v_sel, gqa_info = maybe_repeat_gqa(q_sel, k_sel, v_sel, context.kwargs)
         estimated = estimate_logits_mib(int(q_sel.shape[0]), int(q_sel.shape[1]), int(q_sel.shape[-2]), int(k_sel.shape[-2]))
-        estimated_peak = self._update_peak_estimate(step, estimated)
+        estimated_peak = self._update_peak_estimate(context.step, estimated)
+        self._enforce_memory_guards(context, q_sel, k_sel, estimated, estimated_peak)
+        logits = torch.matmul(q_sel.float(), k_sel.float().transpose(-2, -1)) * context.scale
+        return LogitsBundle(q_sel, k_sel, v_sel, logits, gqa_info, estimated, estimated_peak)
+
+    def _enforce_memory_guards(
+        self,
+        context: AttentionCallContext,
+        q_sel: torch.Tensor,
+        k_sel: torch.Tensor,
+        estimated: float,
+        estimated_peak: float,
+    ) -> None:
         if estimated > self.config.max_logits_mib:
             reason = "vram_guard_exceeded"
             if self.config.fail_mode == "raise":
@@ -1007,7 +1095,7 @@ class AnimaAFMAttentionOverride:
                     f"{LOG_PREFIX} {reason}: q={tuple(q_sel.shape)} k={tuple(k_sel.shape)} "
                     f"estimated_logits_mib={estimated:.1f} guard={self.config.max_logits_mib:.1f}"
                 )
-            return self._fallback(original_func, reason, *args, progress=progress, **kwargs)
+            raise AFMFallback(reason)
         if estimated_peak > self.config.max_peak_mib:
             reason = "peak_vram_guard_exceeded"
             if self.config.fail_mode == "raise":
@@ -1015,89 +1103,113 @@ class AnimaAFMAttentionOverride:
                     f"{LOG_PREFIX} {reason}: q={tuple(q_sel.shape)} k={tuple(k_sel.shape)} "
                     f"estimated_peak_mib={estimated_peak:.1f} guard={self.config.max_peak_mib:.1f}"
                 )
-            return self._fallback(original_func, reason, *args, progress=progress, **kwargs)
+            raise AFMFallback(reason)
 
-        logits = torch.matmul(q_sel.float(), k_sel.float().transpose(-2, -1)) * float(scale)
-        entropy_value = normalized_token_entropy(logits) if self.config.entropy_gate else None
-        alpha_lf, alpha_hf = schedule_alphas(self.config, progress.progress, entropy_value)
-
-        edited_logits = edit_logits_fft(logits, spatial_shape, alpha_lf, alpha_hf, self.config)
-
-        out_sel = attention_from_edited_logits(
-            edited_logits,
-            v_sel,
-            int(q_sel.shape[1]),
-            bool(kwargs.get("skip_output_reshape", False)),
+    def _compose_partial_branch_output(self, context: AttentionCallContext, out_sel: torch.Tensor) -> torch.Tensor:
+        if int(context.selected.numel()) == context.batch:
+            return out_sel
+        base_out = context.original_func(*context.args, **context.kwargs)
+        return base_out.index_copy(
+            0,
+            context.selected.to(device=base_out.device),
+            out_sel.to(device=base_out.device, dtype=base_out.dtype),
         )
 
-        out = out_sel
-        if not all_selected:
-            base_out = original_func(*args, **kwargs)
-            out = base_out.index_copy(0, selected.to(device=base_out.device), out_sel.to(device=base_out.device, dtype=base_out.dtype))
+    def _compute_edit_diagnostics(
+        self,
+        context: AttentionCallContext,
+        logits: torch.Tensor,
+        edited_logits: torch.Tensor,
+    ) -> list[SpectralDiagnostic]:
+        if not self._should_run_spectral_diag(context.progress, context.eligible_call_index):
+            return []
+        diagnostics = sampled_spectral_diagnostics(
+            logits,
+            edited_logits,
+            context.spatial_shape,
+            self.config,
+            context.selected,
+            context.batch,
+            context.cond_or_uncond,
+            edit_applied=True,
+        )
+        if self.config.diagnostic_include_unselected and int(context.selected.numel()) < context.batch:
+            unselected = self._unselected_indices(context.batch, context.selected)
+            if unselected.numel() > 0:
+                diagnostics.extend(self._compute_passthrough_diagnostics(context, unselected))
+        return diagnostics
+
+    def _handle_edit_call(self, context: AttentionCallContext) -> torch.Tensor:
+        try:
+            bundle = self._compute_logits_bundle(context)
+        except AFMFallback as exc:
+            return self._fallback(context.original_func, exc.reason, *context.args, progress=context.progress, **context.kwargs)
+
+        entropy_value = normalized_token_entropy(bundle.logits) if self.config.entropy_gate else None
+        alpha_lf, alpha_hf = schedule_alphas(self.config, context.progress.progress, entropy_value)
+        edited_logits = edit_logits_fft(bundle.logits, context.spatial_shape, alpha_lf, alpha_hf, self.config)
+        out_sel = attention_from_edited_logits(
+            edited_logits,
+            bundle.v,
+            int(bundle.q.shape[1]),
+            bool(context.kwargs.get("skip_output_reshape", False)),
+        )
+        out = self._compose_partial_branch_output(context, out_sel)
 
         self.stats.edited_calls += 1
-        step.edited_calls += 1
-        logits_delta = float((edited_logits - logits).abs().max().detach().cpu().item())
-        step.max_logit_delta = max(step.max_logit_delta, logits_delta)
-        diagnostics: list[SpectralDiagnostic] = []
-        if self._should_run_spectral_diag(progress, eligible_call_index):
-            diagnostics = sampled_spectral_diagnostics(
-                logits,
-                edited_logits,
-                spatial_shape,
-                self.config,
-                selected,
-                batch,
-                cond_or_uncond,
-                edit_applied=True,
-            )
-            if self.config.diagnostic_include_unselected and int(selected.numel()) < batch:
-                unselected = self._unselected_indices(batch, selected)
-                if unselected.numel() > 0:
-                    q_unselected = q.index_select(0, unselected)
-                    k_unselected = k.index_select(0, unselected)
-                    v_unselected = v.index_select(0, unselected)
-                    try:
-                        q_unselected, k_unselected, v_unselected, _ = maybe_repeat_gqa(q_unselected, k_unselected, v_unselected, kwargs)
-                        passthrough_logits = torch.matmul(
-                            q_unselected.float(),
-                            k_unselected.float().transpose(-2, -1),
-                        ) * float(scale)
-                        diagnostics.extend(sampled_spectral_diagnostics(
-                            passthrough_logits,
-                            passthrough_logits,
-                            spatial_shape,
-                            self.config,
-                            unselected,
-                            batch,
-                            cond_or_uncond,
-                            edit_applied=False,
-                        ))
-                    except AFMFallback:
-                        pass
-            self._record_spectral_diagnostics(step, eligible_call_index, diagnostics)
+        context.step.edited_calls += 1
+        logits_delta = float((edited_logits - bundle.logits).abs().max().detach().cpu().item())
+        context.step.max_logit_delta = max(context.step.max_logit_delta, logits_delta)
+        diagnostics = self._compute_edit_diagnostics(context, bundle.logits, edited_logits)
+        self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
+        self._log_eligible_from_context(
+            context,
+            "edit",
+            alpha_lf,
+            alpha_hf,
+            entropy_value,
+            bundle.gqa_info,
+            bundle.estimated_logits_mib,
+            bundle.estimated_peak_mib,
+            logits_delta,
+            diagnostics,
+        )
+        return out
+
+    def _log_eligible_from_context(
+        self,
+        context: AttentionCallContext,
+        mode: str,
+        alpha_lf: float | None,
+        alpha_hf: float | None,
+        entropy_value: float | None,
+        gqa_info: GQAInfo | None,
+        estimated_logits_mib: float,
+        estimated_peak_mib: float,
+        logits_delta: float | None,
+        diagnostics: list[SpectralDiagnostic],
+    ) -> None:
         self._log_eligible(
-            mode="edit",
-            progress=progress,
-            q=q,
-            k=k,
-            v=v,
-            spatial_shape=spatial_shape,
+            mode=mode,
+            progress=context.progress,
+            q=context.q,
+            k=context.k,
+            v=context.v,
+            spatial_shape=context.spatial_shape,
             alpha_lf=alpha_lf,
             alpha_hf=alpha_hf,
             entropy_value=entropy_value,
-            selected=selected,
-            cond_or_uncond=cond_or_uncond,
+            selected=context.selected,
+            cond_or_uncond=context.cond_or_uncond,
             gqa_info=gqa_info,
-            estimated_logits_mib=estimated,
-            estimated_peak_mib=estimated_peak,
+            estimated_logits_mib=estimated_logits_mib,
+            estimated_peak_mib=estimated_peak_mib,
             logits_delta=logits_delta,
             diagnostics=diagnostics,
-            eligible_call_index=eligible_call_index,
-            block_id=block_id,
-            metadata=metadata,
+            eligible_call_index=context.eligible_call_index,
+            block_id=context.block_id,
+            metadata=context.metadata,
         )
-        return out
 
     def _progress_from_kwargs(self, kwargs: dict[str, Any]) -> ProgressInfo | None:
         transformer_options = kwargs.get("transformer_options") or {}
@@ -1350,6 +1462,7 @@ class AnimaAFMAttentionOverride:
             "snapshot_reason": snapshot_reason,
             "snapshot_call_index": eligible_call_index,
             "final_reason": final_reason,
+            "call_mode": mode,
             "mode": mode,
             "calls": step.total_calls,
             "eligible": step.eligible_calls,
@@ -1370,6 +1483,7 @@ class AnimaAFMAttentionOverride:
             "shape_counts": _counter_dict(step.shape_counts),
             "cond_or_uncond": cond_or_uncond,
             "branch_mode": self.config.branch_mode,
+            "edit_selected_indices": selected_indices,
             "selected_indices": selected_indices,
             "selected_count": len(selected_indices),
             "diagnostic_branch": self.config.diagnostic_branch,
@@ -1391,9 +1505,13 @@ class AnimaAFMAttentionOverride:
             },
             "estimated_logits_mib": estimated_logits_mib,
             "estimated_peak_mib": effective_peak_mib,
+            "memory_estimate": memory_estimate_record(estimated_logits_mib, effective_peak_mib),
             "max_estimated_logits_mib": step.max_estimated_logits_mib,
             "max_peak_mib": step.max_estimated_peak_mib,
             "target_call_indices": self.config.target_call_indices,
+            "diagnostic_call_indices": self.config.diagnostic_call_indices,
+            "target_call_selected": None if eligible_call_index is None else self._target_call_selected(eligible_call_index),
+            "diagnostic_call_selected": None if eligible_call_index is None else self._diagnostic_call_selected(eligible_call_index),
             "diagnostic_include_unselected": self.config.diagnostic_include_unselected,
             "max_logit_delta": logits_delta,
         })
@@ -1417,6 +1535,8 @@ class AnimaAFMAttentionOverride:
         estimated_logits_mib: float,
         estimated_peak_mib: float,
     ) -> None:
+        diagnostic_mode = self._diagnostic_mode(mode, diagnostic)
+        edit_selected_indices = [int(i) for i in selected.detach().cpu().tolist()]
         self._emit_text(
             "%s spectral_diag step_index=%s eligible_call_index=%s mode=%s branch=%s rho_before=%.6g "
             "rho_after=%.6g delta_rho=%.6g edit_applied=%s attn_delta_mean=%.6g attn_delta_max=%.6g batch_indices=%s",
@@ -1435,16 +1555,24 @@ class AnimaAFMAttentionOverride:
         )
         record = self._record_base("spectral_diag", progress)
         record.update({
+            "call_mode": mode,
+            "diagnostic_mode": diagnostic_mode,
             "mode": mode,
             "eligible_call_index": eligible_call_index,
+            "target_call_indices": self.config.target_call_indices,
+            "diagnostic_call_indices": self.config.diagnostic_call_indices,
+            "target_call_selected": self._target_call_selected(eligible_call_index),
+            "diagnostic_call_selected": self._diagnostic_call_selected(eligible_call_index),
             "q_shape": list(q.shape),
             "k_shape": list(k.shape),
             "v_shape": list(v.shape),
             "spatial_shape": list(spatial_shape),
             "cond_or_uncond": cond_or_uncond,
             "branch_mode": self.config.branch_mode,
-            "selected_indices": [int(i) for i in selected.detach().cpu().tolist()],
+            "edit_selected_indices": edit_selected_indices,
+            "selected_indices": edit_selected_indices,
             "diagnostic_branch": diagnostic.branch,
+            "diagnostic_batch_indices": diagnostic.batch_indices,
             "batch_indices": diagnostic.batch_indices,
             "alpha_lf": alpha_lf,
             "alpha_hf": alpha_hf,
@@ -1457,8 +1585,18 @@ class AnimaAFMAttentionOverride:
             "attn_delta_max": diagnostic.attn_delta_max,
             "estimated_logits_mib": estimated_logits_mib,
             "estimated_peak_mib": estimated_peak_mib,
+            "memory_estimate": memory_estimate_record(estimated_logits_mib, estimated_peak_mib),
         })
         self._emit_jsonl(record)
+
+    def _diagnostic_mode(self, call_mode: str, diagnostic: SpectralDiagnostic) -> str:
+        if call_mode == "observe":
+            return "observe"
+        if call_mode == "passthrough":
+            return "target_skipped"
+        if diagnostic.edit_applied:
+            return "edited"
+        return "passthrough"
 
 
 def is_anima_like_model(model: Any) -> bool:
