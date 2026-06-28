@@ -20,6 +20,9 @@ FIELDNAMES = [
     "pair_status",
     "step_index",
     "eligible_call_index",
+    "block_id",
+    "block_path",
+    "stage_tag",
     "branch",
     "observe_pair_count",
     "edit_pair_count",
@@ -39,6 +42,10 @@ FIELDNAMES = [
     "edit_selected_indices",
     "diagnostic_batch_indices",
     "selected_indices",
+    "scope_mode",
+    "scope_selected",
+    "scope_id",
+    "scope_reject_reason",
 ]
 
 PAIR_KEY_COLUMNS = ["step_index", "eligible_call_index", "branch"]
@@ -122,7 +129,7 @@ def _normalize_csv_row(row: dict[str, Any]) -> dict[str, Any]:
         parsed = _numeric(normalized.get(key))
         if parsed is not None:
             normalized[key] = parsed
-    for key in ("edit_applied", "target_call_selected", "diagnostic_call_selected"):
+    for key in ("edit_applied", "target_call_selected", "scope_selected", "diagnostic_call_selected"):
         if normalized.get(key) not in (None, ""):
             normalized[key] = _boolish(normalized.get(key))
     return normalized
@@ -180,6 +187,9 @@ def compare_rows(observe_rows: list[dict[str, Any]], edit_rows: list[dict[str, A
             "pair_status": "matched" if observe_pair_count > 0 else "missing_observe",
             "step_index": row.get("step_index"),
             "eligible_call_index": row.get("eligible_call_index"),
+            "block_id": row.get("block_id"),
+            "block_path": row.get("block_path"),
+            "stage_tag": row.get("stage_tag"),
             "branch": row.get("branch"),
             "observe_pair_count": observe_pair_count,
             "edit_pair_count": edit_pair_count,
@@ -199,6 +209,10 @@ def compare_rows(observe_rows: list[dict[str, Any]], edit_rows: list[dict[str, A
             "edit_selected_indices": row.get("edit_selected_indices"),
             "diagnostic_batch_indices": row.get("diagnostic_batch_indices"),
             "selected_indices": row.get("selected_indices"),
+            "scope_mode": row.get("scope_mode"),
+            "scope_selected": row.get("scope_selected"),
+            "scope_id": row.get("scope_id"),
+            "scope_reject_reason": row.get("scope_reject_reason"),
         })
     return PairRows(rows, _pair_analysis(observe_counts, edit_counts))
 

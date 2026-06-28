@@ -82,7 +82,7 @@ def _write_csv(path, rows):
 class SummarizeAFMExperimentsTests(unittest.TestCase):
     def test_reproduces_v7_expected_attached_log_values(self):
         expected = json.loads(Path("tests/fixtures/v7_expected_summary.json").read_text(encoding="utf-8"))
-        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             paths = {
                 "B_call0_vs_A": temp / "B.csv",
@@ -132,7 +132,7 @@ class SummarizeAFMExperimentsTests(unittest.TestCase):
             },
             lambda call, branch: call == 0,
         )
-        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             compare_path = temp / "compare.csv"
             out_dir = temp / "summary"

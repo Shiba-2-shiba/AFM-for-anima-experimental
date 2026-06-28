@@ -5,9 +5,11 @@ import unittest
 import io
 
 import torch
+import torch.nn as nn
 
 from anima_afm import (
     AFMConfig,
+    AnimaAFMBlockMetadataWrapper,
     AnimaAFMAttentionOverride,
     edit_logits_fft,
     estimate_peak_mib,
@@ -18,8 +20,10 @@ from anima_afm import (
     radial_low_high_masks,
     schedule_alphas,
     selected_branch_indices,
+    install_anima_block_metadata_wrappers,
 )
 from scripts.compare_afm_runs import compare_rows, main as compare_main, read_rows, summarize_rows
+from scripts.build_afm_scope_map import build_scope_map
 from scripts.parse_anima_afm_log import iter_json_records, parse_records, write_csv
 
 
@@ -56,6 +60,52 @@ class SentinelAttention:
         )
         self.reference_output = out + offsets * 1000.0
         return self.reference_output
+
+
+class MetadataEchoCrossAttention(nn.Module):
+    context_dim = 8
+
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def forward(self, x, context=None, rope_emb=None, transformer_options=None):
+        self.seen.append(dict(transformer_options or {}))
+        return x + 1
+
+
+class FakeBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cross_attn = MetadataEchoCrossAttention()
+
+
+class FakeDiffusionModel(nn.Module):
+    def __init__(self, block_count=3):
+        super().__init__()
+        self.blocks = nn.ModuleList([FakeBlock() for _ in range(block_count)])
+
+
+class FakeModelPatcher:
+    def __init__(self, diffusion_model):
+        self.diffusion_model = diffusion_model
+        self.patches = {}
+
+    def get_model_object(self, name):
+        if name == "diffusion_model":
+            return self.diffusion_model
+        raise KeyError(name)
+
+    def add_object_patch(self, path, value):
+        self.patches[path] = value
+        current = self
+        parts = path.split(".")
+        for part in parts[:-1]:
+            if part.isdigit():
+                current = current[int(part)]
+            else:
+                current = getattr(current, part)
+        setattr(current, parts[-1], value)
 
 
 class AnimaAFMTests(unittest.TestCase):
@@ -226,6 +276,40 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(override.stats.observed_calls, 1)
         self.assertEqual(override.stats.edited_calls, 0)
         self.assertEqual(override.stats.steps[1].observed_calls, 1)
+
+    def test_observe_mode_respects_scope_filters(self):
+        torch.manual_seed(221)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        original = CountingAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(
+            mode="observe",
+            scope_mode="block_scope",
+            stage_scope="early",
+            debug_level="verbose",
+            debug_format="jsonl",
+        ))
+        selected_kwargs = self._cfg_kwargs(0.5)
+        selected_kwargs["transformer_options"].update({"module_path": "model.blocks.1.attn2", "stage_tag": "early"})
+        rejected_kwargs = self._cfg_kwargs(0.5)
+        rejected_kwargs["transformer_options"].update({"module_path": "model.blocks.20.attn2", "stage_tag": "late"})
+
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(original, q, k, v, 2, **selected_kwargs)
+            override(original, q, k, v, 2, **rejected_kwargs)
+            override.finalize()
+
+        step = override.stats.steps[1]
+        self.assertEqual(step.eligible_calls, 2)
+        self.assertEqual(step.observed_calls, 1)
+        self.assertEqual(step.scope_skipped_calls, 1)
+        self.assertEqual(override.stats.edited_calls, 0)
+        self.assertEqual(original.calls, 2)
+        records = self._json_log_records(logs.records)
+        snapshots = [record for record in records if record["record_type"] == "step_snapshot"]
+        self.assertEqual([record["call_mode"] for record in snapshots], ["observe", "scope_skipped"])
+        self.assertEqual(snapshots[1]["scope_reject_reason"], "block_scope_not_selected")
 
     def test_positive_only_preserves_negative_branch_original_backend(self):
         torch.manual_seed(23)
@@ -407,6 +491,193 @@ class AnimaAFMTests(unittest.TestCase):
         step = override.stats.steps[1]
         self.assertEqual(step.edited_calls, 7)
         self.assertEqual(step.target_skipped_calls, 1)
+
+    def test_discover_mode_returns_original_and_emits_scope_record(self):
+        torch.manual_seed(262)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        original = SentinelAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(
+            mode="discover",
+            debug_level="summary",
+            debug_format="jsonl",
+        ))
+        kwargs = self._cfg_kwargs(0.5)
+        kwargs["transformer_options"].update({
+            "module_path": "model.blocks.1.attn2",
+            "module_class": "CrossAttention",
+            "stage_tag": "encoder_candidate",
+        })
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            out = override(original, q, k, v, 2, **kwargs)
+
+        self.assertTrue(torch.equal(out, original.reference_output))
+        self.assertEqual(original.calls, 1)
+        self.assertEqual(override.stats.observed_calls, 1)
+        self.assertEqual(override.stats.edited_calls, 0)
+        records = self._json_log_records(logs.records)
+        discovery = [record for record in records if record["record_type"] == "afm_scope_discovery_call"][0]
+        self.assertEqual(discovery["block_id"], "model.blocks.1.attn2")
+        self.assertEqual(discovery["block_path"], "model.blocks.1.attn2")
+        self.assertEqual(discovery["module_class"], "CrossAttention")
+        self.assertEqual(discovery["stage_tag"], "encoder_candidate")
+        self.assertEqual(discovery["metadata_source"], "transformer_options")
+        self.assertTrue(discovery["scope_selected"])
+
+    def test_block_scope_edits_only_selected_block(self):
+        torch.manual_seed(263)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        original = CountingAttention()
+        override = AnimaAFMAttentionOverride(AFMConfig(
+            scope_mode="block_scope",
+            block_scope="model.blocks.1.attn2",
+            debug_level="verbose",
+            debug_format="jsonl",
+        ))
+        selected_kwargs = self._cfg_kwargs(0.5)
+        selected_kwargs["transformer_options"].update({"module_path": "model.blocks.1.attn2"})
+        rejected_kwargs = self._cfg_kwargs(0.5)
+        rejected_kwargs["transformer_options"].update({"module_path": "model.blocks.2.attn2"})
+
+        with self.assertLogs("anima_afm", level="INFO") as logs:
+            override(original, q, k, v, 2, **selected_kwargs)
+            override(original, q, k, v, 2, **rejected_kwargs)
+            override.finalize()
+
+        step = override.stats.steps[1]
+        self.assertEqual(step.edited_calls, 1)
+        self.assertEqual(step.scope_skipped_calls, 1)
+        self.assertEqual(original.calls, 1)
+        records = self._json_log_records(logs.records)
+        snapshots = [record for record in records if record["record_type"] == "step_snapshot"]
+        self.assertTrue(any(record["scope_selected"] is True for record in snapshots))
+        self.assertTrue(any(record["scope_reject_reason"] == "block_scope_not_selected" for record in snapshots))
+        final_summary = [
+            record for record in records
+            if record["record_type"] == "step_final_summary" and record["step_index"] == 1
+        ][0]
+        self.assertEqual(final_summary["scope_skipped"], 1)
+
+    def test_encoder_equivalent_scope_map_edits_only_candidate(self):
+        torch.manual_seed(264)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        original = CountingAttention()
+        with tempfile.TemporaryDirectory() as tmp:
+            scope_map = Path(tmp) / "scope_map.json"
+            scope_map.write_text(json.dumps({
+                "schema_version": 1,
+                "entries": [
+                    {
+                        "scope_id": "block:model.blocks.3.attn2",
+                        "block_path": "model.blocks.3.attn2",
+                        "stage_tag": "encoder_candidate",
+                    }
+                ],
+            }), encoding="utf-8")
+            override = AnimaAFMAttentionOverride(AFMConfig(
+                scope_mode="encoder_equivalent",
+                scope_map_path=str(scope_map),
+                debug_level="verbose",
+                debug_format="jsonl",
+            ))
+            candidate_kwargs = self._cfg_kwargs(0.5)
+            candidate_kwargs["transformer_options"].update({"module_path": "model.blocks.3.attn2"})
+            rejected_kwargs = self._cfg_kwargs(0.5)
+            rejected_kwargs["transformer_options"].update({"module_path": "model.blocks.4.attn2"})
+
+            with self.assertLogs("anima_afm", level="INFO") as logs:
+                override(original, q, k, v, 2, **candidate_kwargs)
+                override(original, q, k, v, 2, **rejected_kwargs)
+                override.finalize()
+
+        step = override.stats.steps[1]
+        self.assertEqual(step.edited_calls, 1)
+        self.assertEqual(step.scope_skipped_calls, 1)
+        self.assertEqual(original.calls, 1)
+        records = self._json_log_records(logs.records)
+        snapshots = [record for record in records if record["record_type"] == "step_snapshot"]
+        self.assertTrue(any(record["scope_selected"] is True for record in snapshots))
+        self.assertTrue(any(record["scope_reject_reason"] == "encoder_equivalent_not_selected" for record in snapshots))
+
+    def test_scope_map_builder_promotes_explicit_encoder_candidates_only(self):
+        scope_map = build_scope_map([
+            {
+                "record_type": "afm_scope_discovery_call",
+                "run_id": "run-a",
+                "step_index": 0,
+                "eligible_call_index": 1,
+                "block_id": "model.blocks.1.attn2",
+                "block_path": "model.blocks.1.attn2",
+                "module_class": "CrossAttention",
+                "stage_tag": "encoder_candidate",
+                "spatial_shape": [64, 64],
+                "cond_or_uncond": [1, 0],
+                "metadata_source": "transformer_options",
+            },
+            {
+                "record_type": "afm_scope_discovery_call",
+                "run_id": "run-a",
+                "step_index": 0,
+                "eligible_call_index": 2,
+                "block_id": "unknown",
+                "stage_tag": "unclassified",
+                "fallback_reason": "missing_transformer_metadata",
+            },
+        ], model_fingerprint="model-x", workflow_fingerprint="workflow-y")
+
+        self.assertEqual(scope_map["model_fingerprint"], "model-x")
+        self.assertEqual(scope_map["workflow_fingerprint"], "workflow-y")
+        entries = {entry["block_id"]: entry for entry in scope_map["entries"]}
+        self.assertTrue(entries["model.blocks.1.attn2"]["encoder_equivalent"])
+        self.assertFalse(entries["unknown"]["encoder_equivalent"])
+        self.assertEqual(entries["model.blocks.1.attn2"]["eligible_call_indices_seen"], [1])
+        self.assertIn("stage_tag=encoder_candidate", entries["model.blocks.1.attn2"]["candidate_reasons"])
+
+    def test_scope_map_path_is_ignored_outside_encoder_equivalent_mode(self):
+        override = AnimaAFMAttentionOverride(AFMConfig(
+            scope_mode="all",
+            scope_map_path="does-not-exist.json",
+            fail_mode="raise",
+        ))
+        self.assertIsNotNone(override)
+
+    def test_block_metadata_wrapper_injects_and_restores_transformer_options(self):
+        original = MetadataEchoCrossAttention()
+        wrapper = AnimaAFMBlockMetadataWrapper(
+            original=original,
+            block_index=1,
+            block_count=3,
+            block_path="diffusion_model.blocks.1.cross_attn",
+        )
+        options = {"sigmas": "keep"}
+        x = torch.zeros(1)
+        out = wrapper(x, transformer_options=options)
+
+        self.assertTrue(torch.equal(out, torch.ones(1)))
+        self.assertEqual(options, {"sigmas": "keep"})
+        seen = original.seen[0]
+        self.assertEqual(seen["block_id"], "blocks.1.cross_attn")
+        self.assertEqual(seen["block_index"], 1)
+        self.assertEqual(seen["block_path"], "diffusion_model.blocks.1.cross_attn")
+        self.assertEqual(seen["stage_tag"], "middle")
+
+    def test_install_anima_block_metadata_wrappers_uses_object_patches(self):
+        diffusion_model = FakeDiffusionModel(block_count=3)
+        patcher = FakeModelPatcher(diffusion_model)
+        installed = install_anima_block_metadata_wrappers(patcher)
+
+        self.assertEqual(installed, 3)
+        self.assertEqual(sorted(patcher.patches), [
+            "diffusion_model.blocks.0.cross_attn",
+            "diffusion_model.blocks.1.cross_attn",
+            "diffusion_model.blocks.2.cross_attn",
+        ])
+        self.assertIsInstance(diffusion_model.blocks[0].cross_attn, AnimaAFMBlockMetadataWrapper)
 
     def test_spectral_diag_reports_rho_delta(self):
         torch.manual_seed(26)
@@ -782,7 +1053,7 @@ class AnimaAFMTests(unittest.TestCase):
         q = torch.randn(2, 2, 16, 4)
         k = torch.randn(2, 2, 5, 4)
         v = torch.randn(2, 2, 5, 4)
-        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             jsonl_path = str(Path(temp_dir) / "afm-debug.jsonl")
             override = AnimaAFMAttentionOverride(AFMConfig(
                 spectral_diag="sampled",
@@ -912,7 +1183,7 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(summary["missing_observe"], 1)
         self.assertEqual(summary["late_window"]["start_step"], 16)
 
-        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             observe_path = Path(temp_dir) / "observe.jsonl"
             edit_path = Path(temp_dir) / "edit.jsonl"
             observe_path.write_text("", encoding="utf-8")
@@ -944,7 +1215,7 @@ class AnimaAFMTests(unittest.TestCase):
             "rho_after": 0.25,
             "delta_rho_local": 0.05,
         }
-        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             jsonl_path = Path(temp_dir) / "observe.jsonl"
             csv_path = Path(temp_dir) / "edit.csv"
             jsonl_path.write_text(json.dumps(observe_record) + "\n", encoding="utf-8")

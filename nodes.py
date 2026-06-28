@@ -16,8 +16,10 @@ from .anima_afm import (
     DIAGNOSTIC_BRANCHES,
     FAIL_MODES,
     SCHEDULES,
+    SCOPE_MODES,
     SPECTRAL_DIAG_MODES,
     ZERO_STRENGTH_MODES,
+    install_anima_block_metadata_wrappers,
     is_anima_like_model,
 )
 
@@ -57,6 +59,10 @@ class AnimaAFMModelPatch(io.ComfyNode):
                 io.Float.Input("max_logits_mib", default=1024.0, min=1.0, max=65536.0, step=16.0, advanced=True),
                 io.Float.Input("max_peak_mib", default=4096.0, min=1.0, max=262144.0, step=16.0, advanced=True),
                 io.String.Input("target_call_indices", default="all", advanced=True),
+                io.Combo.Input("scope_mode", options=SCOPE_MODES, default="block_scope", advanced=True),
+                io.String.Input("scope_map_path", default="", advanced=True),
+                io.String.Input("block_scope", default="", advanced=True),
+                io.String.Input("stage_scope", default="early", advanced=True),
                 io.Combo.Input("spectral_diag", options=SPECTRAL_DIAG_MODES, default="off", advanced=True),
                 io.String.Input("diagnostic_call_indices", default="0", advanced=True),
                 io.Boolean.Input("diagnostic_include_unselected", default=False, advanced=True),
@@ -94,6 +100,10 @@ class AnimaAFMModelPatch(io.ComfyNode):
         max_logits_mib,
         max_peak_mib,
         target_call_indices,
+        scope_mode,
+        scope_map_path,
+        block_scope,
+        stage_scope,
         spectral_diag,
         diagnostic_call_indices,
         diagnostic_include_unselected,
@@ -127,6 +137,10 @@ class AnimaAFMModelPatch(io.ComfyNode):
             max_logits_mib=max_logits_mib,
             max_peak_mib=max_peak_mib,
             target_call_indices=target_call_indices,
+            scope_mode=scope_mode,
+            scope_map_path=scope_map_path.strip() or None,
+            block_scope=block_scope,
+            stage_scope=stage_scope,
             spectral_diag=spectral_diag,
             diagnostic_call_indices=diagnostic_call_indices,
             diagnostic_include_unselected=diagnostic_include_unselected,
@@ -142,14 +156,16 @@ class AnimaAFMModelPatch(io.ComfyNode):
             raise ValueError("Anima AFM cannot be combined with an existing optimized_attention_override patch yet.")
 
         transformer_options["optimized_attention_override"] = AnimaAFMAttentionOverride(config)
+        metadata_wrappers = install_anima_block_metadata_wrappers(patched)
         LOGGER.info(
-            "[AnimaAFM] installed model patch mode=%s strength=%s cutoff=%s schedule=%s branch_mode=%s zero_strength_mode=%s",
+            "[AnimaAFM] installed model patch mode=%s strength=%s cutoff=%s schedule=%s branch_mode=%s zero_strength_mode=%s metadata_wrappers=%s",
             mode,
             strength,
             cutoff,
             schedule,
             branch_mode,
             zero_strength_mode,
+            metadata_wrappers,
         )
         return io.NodeOutput(patched)
 

@@ -39,6 +39,10 @@ alpha_lf=1.0000 alpha_hf=1.2000
 
 Set `target_call_indices=all`, a comma list such as `0,7,14`, or a range such as `7-13` to scope editing by stable per-step eligible call index. Calls outside the target scope return the original attention output and are counted as `target_skipped`, not fallbacks.
 
+`mode=discover` records all eligible cross-attention calls so scope maps can be built without hiding candidates. `mode=observe` respects `target_call_indices` and block/stage scope filters, so it can be used as a candidate-scope baseline before `mode=edit`.
+
+The node defaults are tuned for the current Anima validation path: `mode=edit`, `strength=0.20`, `scope_mode=block_scope`, and `stage_scope=early`. This edits the 10 discovered early cross-attention blocks by default; switch `scope_mode=all` explicitly for all-call paper-like stress tests.
+
 Set `debug_format=jsonl` or `both` for machine-readable records. Set `jsonl_path` to also append those records to a JSONL file while preserving logger output. JSONL records now use `schema_version=2`. Spectral diagnostics include separate `negative` and `positive` records when `cond_or_uncond=[1, 0]` and `diagnostic_branch=both_separate`. Use `diagnostic_call_indices=all`, comma lists, or ranges plus `diagnostic_every_n_steps` to limit spectral work while preserving stable `eligible_call_index` identities. `target_call_indices` and `diagnostic_call_indices` are independent: the former controls edited calls, the latter controls diagnostic work. In `positive_only` or `negative_only`, set `diagnostic_include_unselected=true` to emit passthrough spectral diagnostics for the unedited CFG branch without changing the output.
 
 Schema v2 separates fields that were ambiguous in earlier logs:

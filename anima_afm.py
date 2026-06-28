@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
+import torch.nn as nn
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,16 +20,23 @@ BRANCH_MODES = ["both", "positive_only", "negative_only"]
 DEBUG_LEVELS = ["off", "summary", "verbose"]
 DEBUG_FORMATS = ["text", "jsonl", "both"]
 FAIL_MODES = ["fallback", "raise"]
-AFM_MODES = ["edit", "observe", "off"]
+AFM_MODES = ["edit", "observe", "discover", "off"]
 ZERO_STRENGTH_MODES = ["original", "observe", "manual"]
 SPECTRAL_DIAG_MODES = ["off", "sampled", "full"]
 DIAGNOSTIC_BRANCHES = ["selected_mean", "positive", "negative", "both_separate"]
+SCOPE_MODES = ["all", "target_call_indices", "block_scope", "encoder_equivalent"]
 SUMMARY_ONLY_FALLBACK_REASONS = ("not_cross_attention",)
 TRANSFORMER_METADATA_KEYS = (
     "block",
+    "block_id",
     "block_index",
     "transformer_index",
     "module_path",
+    "block_path",
+    "module_class",
+    "stage",
+    "stage_tag",
+    "afm_scope",
     "patches_replace",
 )
 
@@ -56,6 +64,10 @@ class AFMConfig:
     max_logits_mib: float = 1024.0
     max_peak_mib: float = 4096.0
     target_call_indices: str = "all"
+    scope_mode: str = "all"
+    scope_map_path: str | None = None
+    block_scope: str = ""
+    stage_scope: str = ""
     spectral_diag: str = "off"
     diagnostic_call_indices: str = "0"
     diagnostic_include_unselected: bool = False
@@ -86,6 +98,8 @@ class AFMConfig:
             raise ValueError(f"Unsupported AFM spectral_diag: {self.spectral_diag!r}")
         if self.diagnostic_branch not in DIAGNOSTIC_BRANCHES:
             raise ValueError(f"Unsupported AFM diagnostic_branch: {self.diagnostic_branch!r}")
+        if self.scope_mode not in SCOPE_MODES:
+            raise ValueError(f"Unsupported AFM scope_mode: {self.scope_mode!r}")
         parse_call_index_scope(self.diagnostic_call_indices)
         parse_call_index_scope(self.target_call_indices)
         if not 0.0 <= self.start_percent <= 1.0:
@@ -138,6 +152,7 @@ class StepStats:
     edited_calls: int = 0
     observed_calls: int = 0
     target_skipped_calls: int = 0
+    scope_skipped_calls: int = 0
     fallback_calls: int = 0
     fallback_reasons: Counter[str] = field(default_factory=Counter)
     shape_counts: Counter[str] = field(default_factory=Counter)
@@ -171,6 +186,7 @@ class AFMRuntimeStats:
     edited_calls: int = 0
     observed_calls: int = 0
     target_skipped_calls: int = 0
+    scope_skipped_calls: int = 0
     fallback_calls: int = 0
     fallback_reasons: dict[str, int] = field(default_factory=dict)
     steps: dict[int, StepStats] = field(default_factory=dict)
@@ -241,9 +257,31 @@ class AttentionCallContext:
     eligible_call_index: int
     block_id: str
     metadata: dict[str, Any]
+    scope_identity: "ScopeIdentity"
     target_call_selected: bool
     diagnostic_call_selected: bool
+    scope_selected: bool
+    scope_id: str | None
+    scope_reject_reason: str | None
     active_mode: str
+
+
+@dataclass(frozen=True)
+class ScopeIdentity:
+    block_id: str
+    block_path: str | None
+    module_class: str | None
+    block_index: int | None
+    stage_tag: str
+    metadata_source: str
+    fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopeSelection:
+    selected: bool
+    scope_id: str | None
+    reject_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -439,6 +477,12 @@ def discover_transformer_metadata(transformer_options: dict[str, Any]) -> tuple[
     block = metadata.get("block")
     if isinstance(block, list) and block:
         block_id = ":".join(str(part) for part in block)
+    elif "block_id" in metadata:
+        block_id = str(metadata["block_id"])
+    elif "block_path" in metadata:
+        block_id = str(metadata["block_path"])
+    elif "module_path" in metadata:
+        block_id = str(metadata["module_path"])
     elif "block_index" in metadata:
         block_id = str(metadata["block_index"])
     elif "transformer_index" in metadata:
@@ -446,6 +490,253 @@ def discover_transformer_metadata(transformer_options: dict[str, Any]) -> tuple[
     else:
         block_id = "unknown"
     return block_id, metadata
+
+
+def _metadata_text(metadata: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+        elif isinstance(value, int):
+            return str(value)
+    return None
+
+
+def _metadata_int(metadata: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                continue
+    return None
+
+
+def scope_identity_from_metadata(block_id: str, metadata: dict[str, Any]) -> ScopeIdentity:
+    block_path = _metadata_text(metadata, "block_path", "module_path")
+    module_class = _metadata_text(metadata, "module_class")
+    block_index = _metadata_int(metadata, "block_index", "transformer_index")
+    stage_tag = _metadata_text(metadata, "stage_tag", "stage")
+    if stage_tag is None:
+        stage_tag = "unclassified"
+    metadata_source = "transformer_options" if metadata else "fallback"
+    fallback_reason = None if metadata else "missing_transformer_metadata"
+    return ScopeIdentity(
+        block_id=block_id,
+        block_path=block_path,
+        module_class=module_class,
+        block_index=block_index,
+        stage_tag=stage_tag,
+        metadata_source=metadata_source,
+        fallback_reason=fallback_reason,
+    )
+
+
+def parse_scope_tokens(spec: str | None) -> set[str]:
+    if spec is None:
+        return set()
+    normalized = str(spec).strip()
+    if not normalized or normalized.lower() == "all":
+        return set()
+    tokens = {part.strip() for part in normalized.split(",") if part.strip()}
+    return tokens
+
+
+def _scope_entry_is_encoder_candidate(entry: dict[str, Any]) -> bool:
+    if entry.get("encoder_equivalent") is True or entry.get("candidate") is True:
+        return True
+    stage = str(entry.get("stage_tag", "")).strip().lower()
+    if stage in {"encoder_candidate", "encoder_equivalent"}:
+        return True
+    labels = entry.get("labels")
+    if isinstance(labels, list) and any(str(label).strip().lower() in {"encoder_candidate", "encoder_equivalent"} for label in labels):
+        return True
+    return False
+
+
+def _scope_entry_values(entry: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for key in ("scope_id", "block_id", "block_path", "module_path", "stage_tag"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            values.add(value.strip())
+    return values
+
+
+def load_scope_map_entries(path: str | None) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        entries = data.get("entries", [])
+    elif isinstance(data, list):
+        entries = data
+    else:
+        raise ValueError(f"Unsupported AFM scope map format: {type(data).__name__}")
+    if not isinstance(entries, list):
+        raise ValueError("AFM scope map 'entries' must be a list")
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+class ScopeMatcher:
+    def __init__(self, config: AFMConfig):
+        self.config = config
+        self.block_tokens = parse_scope_tokens(config.block_scope)
+        self.stage_tokens = parse_scope_tokens(config.stage_scope)
+        self.load_error: str | None = None
+        try:
+            self.map_entries = load_scope_map_entries(config.scope_map_path) if config.scope_mode == "encoder_equivalent" else []
+        except Exception as exc:
+            if config.fail_mode == "raise":
+                raise
+            self.map_entries = []
+            self.load_error = f"{type(exc).__name__}: {exc}"
+        self.encoder_candidate_tokens: set[str] = set()
+        self.map_tokens: set[str] = set()
+        for entry in self.map_entries:
+            values = _scope_entry_values(entry)
+            self.map_tokens.update(values)
+            if _scope_entry_is_encoder_candidate(entry):
+                self.encoder_candidate_tokens.update(values)
+
+    def select(self, identity: ScopeIdentity) -> ScopeSelection:
+        if self.config.scope_mode in ("all", "target_call_indices"):
+            return ScopeSelection(True, identity.block_id, None)
+        if self.config.scope_mode == "block_scope":
+            return self._select_block_scope(identity)
+        if self.config.scope_mode == "encoder_equivalent":
+            return self._select_encoder_equivalent(identity)
+        return ScopeSelection(False, identity.block_id, "unsupported_scope_mode")
+
+    def _identity_tokens(self, identity: ScopeIdentity) -> set[str]:
+        tokens = {identity.block_id, identity.stage_tag}
+        if identity.block_path:
+            tokens.add(identity.block_path)
+        if identity.module_class:
+            tokens.add(identity.module_class)
+        if identity.block_index is not None:
+            tokens.add(str(identity.block_index))
+        return {token for token in tokens if token}
+
+    def _select_block_scope(self, identity: ScopeIdentity) -> ScopeSelection:
+        identity_tokens = self._identity_tokens(identity)
+        if self.block_tokens and identity_tokens.intersection(self.block_tokens):
+            return ScopeSelection(True, identity.block_id, None)
+        if self.stage_tokens and identity.stage_tag in self.stage_tokens:
+            return ScopeSelection(True, identity.block_id, None)
+        if not self.block_tokens and not self.stage_tokens:
+            return ScopeSelection(False, identity.block_id, "empty_block_scope")
+        return ScopeSelection(False, identity.block_id, "block_scope_not_selected")
+
+    def _select_encoder_equivalent(self, identity: ScopeIdentity) -> ScopeSelection:
+        identity_tokens = self._identity_tokens(identity)
+        if self.stage_tokens and identity.stage_tag in self.stage_tokens:
+            return ScopeSelection(True, identity.block_id, None)
+        if self.load_error is not None:
+            return ScopeSelection(False, identity.block_id, "scope_map_load_failed")
+        if not self.encoder_candidate_tokens:
+            return ScopeSelection(False, identity.block_id, "no_encoder_equivalent_candidates")
+        if identity_tokens.intersection(self.encoder_candidate_tokens):
+            return ScopeSelection(True, identity.block_id, None)
+        return ScopeSelection(False, identity.block_id, "encoder_equivalent_not_selected")
+
+
+def stage_tag_for_block(block_index: int, block_count: int) -> str:
+    if block_count <= 0:
+        return "unclassified"
+    third = max(block_count / 3.0, 1.0)
+    if block_index < third:
+        return "early"
+    if block_index < third * 2.0:
+        return "middle"
+    return "late"
+
+
+class AnimaAFMBlockMetadataWrapper(nn.Module):
+    def __init__(self, original: nn.Module, block_index: int, block_count: int, block_path: str):
+        super().__init__()
+        self.original = original
+        self.block_index = int(block_index)
+        self.block_count = int(block_count)
+        self.block_path = block_path
+        self.stage_tag = stage_tag_for_block(self.block_index, self.block_count)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        transformer_options = kwargs.get("transformer_options")
+        created_options = False
+        if transformer_options is None:
+            transformer_options = {}
+            kwargs["transformer_options"] = transformer_options
+            created_options = True
+        if not isinstance(transformer_options, dict):
+            return self.original(*args, **kwargs)
+
+        patch_values = {
+            "block": ("blocks", self.block_index, "cross_attn"),
+            "block_id": f"blocks.{self.block_index}.cross_attn",
+            "block_index": self.block_index,
+            "module_path": self.block_path,
+            "block_path": self.block_path,
+            "module_class": self.original.__class__.__name__,
+            "stage_tag": self.stage_tag,
+            "afm_scope": self.stage_tag,
+        }
+        previous = {key: transformer_options.get(key, None) for key in patch_values}
+        missing = {key for key in patch_values if key not in transformer_options}
+        transformer_options.update(patch_values)
+        try:
+            return self.original(*args, **kwargs)
+        finally:
+            for key, value in previous.items():
+                if key in missing:
+                    transformer_options.pop(key, None)
+                else:
+                    transformer_options[key] = value
+
+
+def unwrap_afm_block_metadata_wrapper(module: Any) -> Any:
+    while isinstance(module, AnimaAFMBlockMetadataWrapper):
+        module = module.original
+    return module
+
+
+def install_anima_block_metadata_wrappers(model_patcher: Any) -> int:
+    try:
+        diffusion_model = model_patcher.get_model_object("diffusion_model")
+    except Exception:
+        diffusion_model = getattr(getattr(model_patcher, "model", None), "diffusion_model", None)
+    if diffusion_model is None or not hasattr(diffusion_model, "blocks"):
+        return 0
+    blocks = getattr(diffusion_model, "blocks")
+    try:
+        block_count = len(blocks)
+    except TypeError:
+        return 0
+    if not hasattr(model_patcher, "add_object_patch"):
+        return 0
+
+    installed = 0
+    for index in range(block_count):
+        block = blocks[index]
+        if not hasattr(block, "cross_attn"):
+            continue
+        original = unwrap_afm_block_metadata_wrapper(getattr(block, "cross_attn"))
+        wrapper = AnimaAFMBlockMetadataWrapper(
+            original=original,
+            block_index=index,
+            block_count=block_count,
+            block_path=f"diffusion_model.blocks.{index}.cross_attn",
+        )
+        model_patcher.add_object_patch(f"diffusion_model.blocks.{index}.cross_attn", wrapper)
+        installed += 1
+    return installed
 
 
 def _counter_dict(counter: Counter[str]) -> dict[str, int]:
@@ -737,6 +1028,7 @@ class AnimaAFMAttentionOverride:
         self.run_id = f"afm-{id(self):x}"
         self._diagnostic_call_indices = parse_call_index_scope(config.diagnostic_call_indices)
         self._target_call_indices = parse_call_index_scope(config.target_call_indices)
+        self._scope_matcher = ScopeMatcher(config)
 
     def finalize(self) -> None:
         if self.stats.active_step_index is not None:
@@ -885,6 +1177,40 @@ class AnimaAFMAttentionOverride:
         self._emit_jsonl(record)
         self.stats.metadata_discovery_emitted = True
 
+    def _log_scope_discovery_call(self, context: AttentionCallContext) -> None:
+        if self.config.debug_level == "off":
+            return
+        if self.config.mode != "discover" and self.config.debug_level != "verbose":
+            return
+        identity = context.scope_identity
+        record = self._record_base("afm_scope_discovery_call", context.progress)
+        record.update({
+            "eligible_call_index": context.eligible_call_index,
+            "global_call_index": context.step.total_calls - 1,
+            "block_id": context.block_id,
+            "block_path": identity.block_path,
+            "module_class": identity.module_class,
+            "block_index": identity.block_index,
+            "stage_tag": identity.stage_tag,
+            "attention_kind": "cross",
+            "branch": context.cond_or_uncond,
+            "cond_or_uncond": context.cond_or_uncond,
+            "q_shape": list(context.q.shape),
+            "k_shape": list(context.k.shape),
+            "v_shape": list(context.v.shape),
+            "spatial_shape": list(context.spatial_shape),
+            "text_len": context.text_len,
+            "target_call_selected": context.target_call_selected,
+            "scope_mode": self.config.scope_mode,
+            "scope_selected": context.scope_selected,
+            "scope_id": context.scope_id,
+            "scope_reject_reason": context.scope_reject_reason,
+            "metadata_source": identity.metadata_source,
+            "fallback_reason": identity.fallback_reason,
+            "metadata": context.metadata,
+        })
+        self._emit_jsonl(record)
+
     def _spectral_summary(self, step: StepStats) -> dict[str, Any]:
         records = step.spectral_diagnostic_records
         if not records:
@@ -926,6 +1252,7 @@ class AnimaAFMAttentionOverride:
             "edited": step.edited_calls,
             "observed": step.observed_calls,
             "target_skipped": step.target_skipped_calls,
+            "scope_skipped": step.scope_skipped_calls,
             "fallbacks": step.fallback_calls,
             "fallback_reasons": _counter_dict(step.fallback_reasons),
             "fallback_suppressed_reasons": _counter_dict(step.fallback_suppressed_reasons),
@@ -954,6 +1281,7 @@ class AnimaAFMAttentionOverride:
             "edited": self.stats.edited_calls,
             "observed": self.stats.observed_calls,
             "target_skipped": self.stats.target_skipped_calls,
+            "scope_skipped": self.stats.scope_skipped_calls,
             "fallbacks": self.stats.fallback_calls,
             "fallback_reasons": dict(self.stats.fallback_reasons),
             "steps": {
@@ -962,12 +1290,13 @@ class AnimaAFMAttentionOverride:
             },
         })
         self._emit_text(
-            "%s run_final_summary last_step_index=%s expected_total_calls_per_step=%s edited=%s observed=%s fallbacks=%s",
+            "%s run_final_summary last_step_index=%s expected_total_calls_per_step=%s edited=%s observed=%s scope_skipped=%s fallbacks=%s",
             LOG_PREFIX,
             last_step_index,
             self.stats.expected_total_calls_per_step,
             self.stats.edited_calls,
             self.stats.observed_calls,
+            self.stats.scope_skipped_calls,
             self.stats.fallback_calls,
         )
         self._emit_jsonl(record)
@@ -999,10 +1328,14 @@ class AnimaAFMAttentionOverride:
             progress = self._progress_from_kwargs(kwargs)
             return self._fallback(original_func, exc.reason, *args, progress=progress, **kwargs)
 
-        if context.active_mode == "observe":
+        if context.active_mode == "discover":
             return self._handle_observe_call(context)
         if not context.target_call_selected:
             return self._handle_target_skipped_call(context)
+        if not context.scope_selected:
+            return self._handle_scope_skipped_call(context)
+        if context.active_mode == "observe":
+            return self._handle_observe_call(context)
         return self._handle_edit_call(context)
 
     def _handle_off_or_zero_original(self) -> bool:
@@ -1059,11 +1392,21 @@ class AnimaAFMAttentionOverride:
         step = self._step_for(progress)
         eligible_call_index = step.eligible_calls
         block_id, metadata = discover_transformer_metadata(transformer_options)
+        scope_identity = scope_identity_from_metadata(block_id, metadata)
+        scope_selection = self._scope_matcher.select(scope_identity)
         step.eligible_calls += 1
         step.eligible_call_indices[eligible_call_index] += 1
         step.shape_counts[shape_key(q, k)] += 1
         step.selected_counts[f"{int(selected.numel())}/{batch}"] += 1
-        step.eligible_call_metadata[eligible_call_index] = {"block_id": block_id, **metadata}
+        step.eligible_call_metadata[eligible_call_index] = {
+            "block_id": block_id,
+            "block_path": scope_identity.block_path,
+            "module_class": scope_identity.module_class,
+            "block_index": scope_identity.block_index,
+            "stage_tag": scope_identity.stage_tag,
+            "metadata_source": scope_identity.metadata_source,
+            **metadata,
+        }
         self._maybe_log_metadata_discovery(kwargs, transformer_options, progress, eligible_call_index, block_id, metadata)
 
         selected_indices = [int(index) for index in selected.detach().cpu().tolist()]
@@ -1089,8 +1432,12 @@ class AnimaAFMAttentionOverride:
             eligible_call_index=eligible_call_index,
             block_id=block_id,
             metadata=metadata,
+            scope_identity=scope_identity,
             target_call_selected=self._target_call_selected(eligible_call_index),
             diagnostic_call_selected=self._diagnostic_call_selected(eligible_call_index),
+            scope_selected=scope_selection.selected,
+            scope_id=scope_selection.scope_id,
+            scope_reject_reason=scope_selection.reject_reason,
             active_mode=active_mode,
         )
 
@@ -1131,7 +1478,8 @@ class AnimaAFMAttentionOverride:
         diagnostics = self._compute_passthrough_diagnostics(context, context.selected)
         self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
         out = context.original_func(*context.args, **context.kwargs)
-        self._log_eligible_from_context(context, "observe", None, None, None, None, estimated, estimated_peak, None, diagnostics)
+        self._log_scope_discovery_call(context)
+        self._log_eligible_from_context(context, context.active_mode, None, None, None, None, estimated, estimated_peak, None, diagnostics)
         return out
 
     def _handle_target_skipped_call(self, context: AttentionCallContext) -> torch.Tensor:
@@ -1148,7 +1496,26 @@ class AnimaAFMAttentionOverride:
         diagnostics = self._compute_passthrough_diagnostics(context, context.selected)
         self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
         out = context.original_func(*context.args, **context.kwargs)
+        self._log_scope_discovery_call(context)
         self._log_eligible_from_context(context, "passthrough", None, None, None, None, estimated, estimated_peak, None, diagnostics)
+        return out
+
+    def _handle_scope_skipped_call(self, context: AttentionCallContext) -> torch.Tensor:
+        self.stats.scope_skipped_calls += 1
+        context.step.scope_skipped_calls += 1
+        memory_estimate = estimate_attention_memory(
+            int(context.selected.numel()),
+            int(context.q.shape[1]),
+            context.query_len,
+            context.text_len,
+        ).to_record()
+        estimated = memory_estimate["logits_mib"]
+        estimated_peak = self._update_peak_estimate(context.step, estimated, memory_estimate)
+        diagnostics = self._compute_passthrough_diagnostics(context, context.selected)
+        self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
+        out = context.original_func(*context.args, **context.kwargs)
+        self._log_scope_discovery_call(context)
+        self._log_eligible_from_context(context, "scope_skipped", None, None, None, None, estimated, estimated_peak, None, diagnostics)
         return out
 
     def _select_branch_tensors(self, context: AttentionCallContext) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
@@ -1301,6 +1668,10 @@ class AnimaAFMAttentionOverride:
             eligible_call_index=context.eligible_call_index,
             block_id=context.block_id,
             metadata=context.metadata,
+            scope_identity=context.scope_identity,
+            scope_selected=context.scope_selected,
+            scope_id=context.scope_id,
+            scope_reject_reason=context.scope_reject_reason,
         )
 
     def _memory_estimate_for_log(
@@ -1409,6 +1780,10 @@ class AnimaAFMAttentionOverride:
         eligible_call_index: int,
         block_id: str,
         metadata: dict[str, Any],
+        scope_identity: ScopeIdentity,
+        scope_selected: bool,
+        scope_id: str | None,
+        scope_reject_reason: str | None,
     ) -> None:
         if self.config.debug_level == "off":
             return
@@ -1443,6 +1818,10 @@ class AnimaAFMAttentionOverride:
                 eligible_call_index=eligible_call_index,
                 block_id=block_id,
                 metadata=metadata,
+                scope_identity=scope_identity,
+                scope_selected=scope_selected,
+                scope_id=scope_id,
+                scope_reject_reason=scope_reject_reason,
             )
         for diagnostic in diagnostics:
             self._log_spectral_diag(
@@ -1460,6 +1839,10 @@ class AnimaAFMAttentionOverride:
                 alpha_hf=alpha_hf,
                 estimated_logits_mib=estimated_logits_mib,
                 estimated_peak_mib=estimated_peak_mib,
+                scope_identity=scope_identity,
+                scope_selected=scope_selected,
+                scope_id=scope_id,
+                scope_reject_reason=scope_reject_reason,
             )
         if should_log_snapshot and self.config.debug_level == "verbose":
             self.stats.verbose_counts_by_step[progress.index] = verbose_count + 1
@@ -1489,6 +1872,10 @@ class AnimaAFMAttentionOverride:
         eligible_call_index: int | None = None,
         block_id: str = "unknown",
         metadata: dict[str, Any] | None = None,
+        scope_identity: ScopeIdentity | None = None,
+        scope_selected: bool | None = None,
+        scope_id: str | None = None,
+        scope_reject_reason: str | None = None,
         final_reason: str | None = None,
     ) -> None:
         fallback_summary = "{" + ", ".join(f"{key}:{value}" for key, value in step.fallback_reasons.items()) + "}"
@@ -1499,6 +1886,12 @@ class AnimaAFMAttentionOverride:
         q_shape = None if q is None else tuple(q.shape)
         k_shape = None if k is None else tuple(k.shape)
         v_shape = None if v is None else tuple(v.shape)
+        block_path = None if scope_identity is None else scope_identity.block_path
+        module_class = None if scope_identity is None else scope_identity.module_class
+        block_index = None if scope_identity is None else scope_identity.block_index
+        stage_tag = None if scope_identity is None else scope_identity.stage_tag
+        metadata_source = None if scope_identity is None else scope_identity.metadata_source
+        scope_fallback_reason = None if scope_identity is None else scope_identity.fallback_reason
         summary_rho_before = None if record_type in ("step_final_summary", "run_final_summary") else step.rho_before
         summary_rho_after = None if record_type in ("step_final_summary", "run_final_summary") else step.rho_after
         summary_delta_rho = None if record_type in ("step_final_summary", "run_final_summary") else step.delta_rho
@@ -1578,12 +1971,19 @@ class AnimaAFMAttentionOverride:
             "edited": step.edited_calls,
             "observed": step.observed_calls,
             "target_skipped": step.target_skipped_calls,
+            "scope_skipped": step.scope_skipped_calls,
             "fallbacks": step.fallback_calls,
             "fallback_reasons": _counter_dict(step.fallback_reasons),
             "fallback_suppressed_reasons": _counter_dict(step.fallback_suppressed_reasons),
             "eligible_call_indices": _counter_key_dict(step.eligible_call_indices),
             "eligible_call_index": eligible_call_index,
             "block_id": block_id,
+            "block_path": block_path,
+            "module_class": module_class,
+            "block_index": block_index,
+            "stage_tag": stage_tag,
+            "metadata_source": metadata_source,
+            "metadata_fallback_reason": scope_fallback_reason,
             "metadata": metadata or {},
             "q_shape": None if q is None else list(q.shape),
             "k_shape": None if k is None else list(k.shape),
@@ -1620,6 +2020,13 @@ class AnimaAFMAttentionOverride:
             "max_estimated_logits_mib": step.max_estimated_logits_mib,
             "max_peak_mib": step.max_estimated_peak_mib,
             "target_call_indices": self.config.target_call_indices,
+            "scope_mode": self.config.scope_mode,
+            "scope_map_path": self.config.scope_map_path,
+            "block_scope": self.config.block_scope,
+            "stage_scope": self.config.stage_scope,
+            "scope_selected": scope_selected,
+            "scope_id": scope_id,
+            "scope_reject_reason": scope_reject_reason,
             "diagnostic_call_indices": self.config.diagnostic_call_indices,
             "target_call_selected": None if eligible_call_index is None else self._target_call_selected(eligible_call_index),
             "diagnostic_call_selected": None if eligible_call_index is None else self._diagnostic_call_selected(eligible_call_index),
@@ -1645,6 +2052,10 @@ class AnimaAFMAttentionOverride:
         alpha_hf: float | None,
         estimated_logits_mib: float,
         estimated_peak_mib: float,
+        scope_identity: ScopeIdentity,
+        scope_selected: bool,
+        scope_id: str | None,
+        scope_reject_reason: str | None,
     ) -> None:
         diagnostic_mode = self._diagnostic_mode(mode, diagnostic)
         edit_selected_indices = [int(i) for i in selected.detach().cpu().tolist()]
@@ -1670,7 +2081,21 @@ class AnimaAFMAttentionOverride:
             "diagnostic_mode": diagnostic_mode,
             "mode": mode,
             "eligible_call_index": eligible_call_index,
+            "block_id": scope_identity.block_id,
+            "block_path": scope_identity.block_path,
+            "module_class": scope_identity.module_class,
+            "block_index": scope_identity.block_index,
+            "stage_tag": scope_identity.stage_tag,
+            "metadata_source": scope_identity.metadata_source,
+            "metadata_fallback_reason": scope_identity.fallback_reason,
             "target_call_indices": self.config.target_call_indices,
+            "scope_mode": self.config.scope_mode,
+            "scope_map_path": self.config.scope_map_path,
+            "block_scope": self.config.block_scope,
+            "stage_scope": self.config.stage_scope,
+            "scope_selected": scope_selected,
+            "scope_id": scope_id,
+            "scope_reject_reason": scope_reject_reason,
             "diagnostic_call_indices": self.config.diagnostic_call_indices,
             "target_call_selected": self._target_call_selected(eligible_call_index),
             "diagnostic_call_selected": self._diagnostic_call_selected(eligible_call_index),
@@ -1705,6 +2130,8 @@ class AnimaAFMAttentionOverride:
             return "observe"
         if call_mode == "passthrough":
             return "target_skipped"
+        if call_mode == "scope_skipped":
+            return "scope_skipped"
         if diagnostic.edit_applied:
             return "edited"
         return "passthrough"

@@ -44,7 +44,7 @@ class CompareAFMRunsTests(unittest.TestCase):
             {"record_type": "spectral_diag", "step_index": 0, "eligible_call_index": 7, "diagnostic_branch": "positive", "rho_after": 0.3},
             {"record_type": "spectral_diag", "step_index": 0, "eligible_call_index": 7, "diagnostic_branch": "positive", "rho_after": 0.35},
         ]
-        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             observe_path = temp / "observe.jsonl"
             edit_path = temp / "edit.jsonl"
@@ -62,7 +62,7 @@ class CompareAFMRunsTests(unittest.TestCase):
         edit_records = [
             {"record_type": "spectral_diag", "step_index": 0, "eligible_call_index": 0, "diagnostic_branch": "positive", "rho_before": 0.2, "rho_after": 0.4},
         ]
-        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             observe_jsonl = temp / "observe.jsonl"
             edit_jsonl = temp / "edit.jsonl"
