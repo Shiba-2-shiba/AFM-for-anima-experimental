@@ -1,0 +1,38 @@
+[
+  {
+    "case": "rect_16x9_neon",
+    "label": "16:9 rainy neon alley",
+    "width": 1024,
+    "height": 576,
+    "seed": 2606281601,
+    "baseline_prompt_id": "fb95ecbe-3065-462f-b9d1-3aa7f152eeda",
+    "baseline_image": "C:\\ComfyUI\\output\\AFM_rect_examples\\rect_16x9_neon_baseline_00001_.png",
+    "edit_prompt_id": "2fb95e2c-8db1-4edc-b71e-a85a8109fc73",
+    "edit_image": "C:\\ComfyUI\\output\\AFM_rect_examples\\rect_16x9_neon_edit_00001_.png",
+    "comparison": "C:\\ComfyUI\\custom_nodes\\AFM-for-anima-experimental\\docs\\assets\\afm_rect_compare_rect_16x9_neon.png"
+  },
+  {
+    "case": "rect_9x16_clocktower",
+    "label": "9:16 clockwork library",
+    "width": 576,
+    "height": 1024,
+    "seed": 2606281602,
+    "baseline_prompt_id": "184f60da-7522-487e-bbc8-1d11b39fb92f",
+    "baseline_image": "C:\\ComfyUI\\output\\AFM_rect_examples\\rect_9x16_clocktower_baseline_00001_.png",
+    "edit_prompt_id": "b0995994-5d29-4857-a9e6-ad6329b80f4c",
+    "edit_image": "C:\\ComfyUI\\output\\AFM_rect_examples\\rect_9x16_clocktower_edit_00001_.png",
+    "comparison": "C:\\ComfyUI\\custom_nodes\\AFM-for-anima-experimental\\docs\\assets\\afm_rect_compare_rect_9x16_clocktower.png"
+  },
+  {
+    "case": "rect_4x3_greenhouse",
+    "label": "4:3 glass greenhouse",
+    "width": 896,
+    "height": 672,
+    "seed": 2606281603,
+    "baseline_prompt_id": "1adbebcd-2c22-4263-a8f0-4f397879c1aa",
+    "baseline_image": "C:\\ComfyUI\\output\\AFM_rect_examples\\rect_4x3_greenhouse_baseline_00001_.png",
+    "edit_prompt_id": "db1f3661-29f8-4f33-b13b-c2400e0c4f2a",
+    "edit_image": "C:\\ComfyUI\\output\\AFM_rect_examples\\rect_4x3_greenhouse_edit_00001_.png",
+    "comparison": "C:\\ComfyUI\\custom_nodes\\AFM-for-anima-experimental\\docs\\assets\\afm_rect_compare_rect_4x3_greenhouse.png"
+  }
+]

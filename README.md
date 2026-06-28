@@ -137,8 +137,11 @@ debug_format=both
 
 ## Limits
 
-- The MVP only edits square image query grids.
-- Non-square/video query layouts fall back to the original attention.
+- Square image query grids are still the automatic compatibility path.
+- Static non-square images are supported when the shape is explicit: set `spatial_shape_mode=explicit_pixels` with matching `image_width` / `image_height`, or `spatial_shape_mode=explicit_latent` with matching `latent_width` / `latent_height`.
+- Without explicit dimensions or trusted runtime metadata, non-square layouts fall back to the original attention instead of guessing. Conflicting runtime shape candidates are rejected with `spatial_shape_ambiguous`.
+- Current Anima runtime checks did not expose a reliable non-square shape candidate to `auto`; use `explicit_pixels` for 16:9, 9:16, and other non-square static images.
+- Video or time-folded query layouts are not supported yet.
 - If another node already installs `optimized_attention_override`, this node raises a clear error.
 - Full pre-softmax logits are materialized for edited calls. `max_logits_mib` guards logits allocation and `max_peak_mib` guards the conservative full-FFT peak estimate until a later chunked implementation exists.
 

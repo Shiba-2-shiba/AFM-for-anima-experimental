@@ -1,0 +1,167 @@
+{
+  "46": {
+    "inputs": {
+      "filename_prefix": "Anima",
+      "images": [
+        "73",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "画像を保存"
+    }
+  },
+  "71": {
+    "inputs": {
+      "clip_name": "qwen_3_06b_base.safetensors",
+      "type": "stable_diffusion",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "CLIPを読み込む"
+    }
+  },
+  "72": {
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "VAEを読み込む"
+    }
+  },
+  "73": {
+    "inputs": {
+      "samples": [
+        "76",
+        0
+      ],
+      "vae": [
+        "72",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAEデコード"
+    }
+  },
+  "74": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "空の潜在画像"
+    }
+  },
+  "75": {
+    "inputs": {
+      "text": "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia",
+      "clip": [
+        "71",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Negative Prompt)"
+    }
+  },
+  "76": {
+    "inputs": {
+      "seed": 875817230929465,
+      "steps": 30,
+      "cfg": 4,
+      "sampler_name": "er_sde",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "79",
+        0
+      ],
+      "positive": [
+        "77",
+        0
+      ],
+      "negative": [
+        "75",
+        0
+      ],
+      "latent_image": [
+        "74",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "Kサンプラー"
+    }
+  },
+  "77": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "71",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "78": {
+    "inputs": {
+      "unet_name": "anima-base-v1.0.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "拡散モデルを読み込む"
+    }
+  },
+  "79": {
+    "inputs": {
+      "mode": "edit",
+      "strength": 0.2,
+      "cutoff": 0.25,
+      "start_percent": 0,
+      "end_percent": 1,
+      "schedule": "curve",
+      "branch_mode": "both",
+      "zero_strength_mode": "observe",
+      "entropy_gate": false,
+      "beta": 20,
+      "gamma": 4,
+      "preserve_dc": true,
+      "soft_mask": true,
+      "mask_width": 0.05,
+      "debug_level": "off",
+      "debug_format": "text",
+      "fail_mode": "fallback",
+      "max_logits_mib": 1024,
+      "max_peak_mib": 4096,
+      "target_call_indices": "all",
+      "spectral_diag": "off",
+      "diagnostic_call_indices": "0",
+      "diagnostic_include_unselected": false,
+      "diagnostic_every_n_steps": 1,
+      "diagnostic_branch": "both_separate",
+      "jsonl_path": "",
+      "max_verbose_fallbacks_per_step_per_reason": 3,
+      "model": [
+        "78",
+        0
+      ]
+    },
+    "class_type": "AnimaAFMModelPatch",
+    "_meta": {
+      "title": "Anima AFM Model Patch"
+    }
+  }
+}

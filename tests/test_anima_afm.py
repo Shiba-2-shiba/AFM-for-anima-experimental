@@ -13,11 +13,14 @@ from anima_afm import (
     AnimaAFMAttentionOverride,
     edit_logits_fft,
     estimate_peak_mib,
+    hf_ratio_from_concentration,
+    infer_spatial_shape,
     infer_square_spatial_shape,
     normalized_token_entropy,
     parse_call_index_scope,
     progress_from_sigmas,
     radial_low_high_masks,
+    sampled_spectral_diagnostics,
     schedule_alphas,
     selected_branch_indices,
     install_anima_block_metadata_wrappers,
@@ -132,6 +135,71 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(infer_square_spatial_shape(64), (8, 8))
         self.assertIsNone(infer_square_spatial_shape(65))
 
+    def test_infer_spatial_shape_explicit_latent_rectangular(self):
+        config = AFMConfig(
+            spatial_shape_mode="explicit_latent",
+            latent_width=84,
+            latent_height=48,
+        )
+        info = infer_spatial_shape(4032, config, {}, {})
+        self.assertEqual(info.shape, (48, 84))
+        self.assertEqual(info.source, "explicit_latent")
+        self.assertIsNone(info.aspect_error)
+
+    def test_infer_spatial_shape_explicit_pixels_rectangular_by_downscale(self):
+        config = AFMConfig(
+            spatial_shape_mode="explicit_pixels",
+            image_width=1344,
+            image_height=768,
+            latent_downscale=16,
+        )
+        info = infer_spatial_shape(4032, config, {}, {})
+        self.assertEqual(info.shape, (48, 84))
+        self.assertEqual(info.source, "explicit_pixels_downscale")
+
+    def test_infer_spatial_shape_explicit_pixels_uses_aspect_when_square_product_is_possible(self):
+        config = AFMConfig(
+            spatial_shape_mode="explicit_pixels",
+            image_width=1600,
+            image_height=900,
+            latent_downscale=16,
+        )
+        info = infer_spatial_shape(2304, config, {}, {})
+        self.assertEqual(info.shape, (36, 64))
+        self.assertEqual(info.source, "explicit_pixels_aspect")
+        self.assertLess(info.aspect_error, 1e-9)
+
+    def test_infer_spatial_shape_explicit_mismatch_is_not_silent_square(self):
+        config = AFMConfig(
+            spatial_shape_mode="explicit_latent",
+            latent_width=64,
+            latent_height=36,
+        )
+        info = infer_spatial_shape(4096, config, {}, {})
+        self.assertIsNone(info.shape)
+        self.assertEqual(info.reason, "spatial_shape_mismatch")
+
+    def test_infer_spatial_shape_auto_reads_runtime_metadata(self):
+        config = AFMConfig(spatial_shape_mode="auto")
+        info = infer_spatial_shape(4032, config, {"latent_height": 48, "latent_width": 84}, {})
+        self.assertEqual(info.shape, (48, 84))
+        self.assertEqual(info.source, "runtime_metadata")
+
+    def test_infer_spatial_shape_auto_rejects_ambiguous_runtime_metadata(self):
+        config = AFMConfig(spatial_shape_mode="auto")
+        info = infer_spatial_shape(
+            2304,
+            config,
+            {
+                "spatial_shape": [36, 64],
+                "latent_shape": [48, 48],
+            },
+            {},
+        )
+        self.assertIsNone(info.shape)
+        self.assertEqual(info.source, "runtime_metadata")
+        self.assertEqual(info.reason, "spatial_shape_ambiguous")
+
     def test_progress_last_model_step_reaches_one(self):
         info = progress_from_sigmas({
             "sigmas": torch.tensor([0.5]),
@@ -159,6 +227,30 @@ class AnimaAFMTests(unittest.TestCase):
         config = AFMConfig(strength=0.2, schedule="curve")
         self.assertEqual(schedule_alphas(config, 0.0), (1.2, 1.0))
         self.assertEqual(schedule_alphas(config, 1.0), (1.0, 1.2))
+
+    def test_rectangular_frequency_masks_and_diagnostics(self):
+        low, high = radial_low_high_masks(3, 4, 0.25, True, 0.05, torch.device("cpu"), torch.float32)
+        self.assertEqual(tuple(low.shape), (3, 4))
+        self.assertEqual(tuple(high.shape), (3, 4))
+        self.assertTrue(torch.allclose(low + high, torch.ones_like(low)))
+
+        concentration = torch.rand(1, 2, 12)
+        rho = hf_ratio_from_concentration(concentration, (3, 4), 0.25)
+        self.assertIsInstance(rho, float)
+
+        before = torch.randn(1, 2, 12, 5)
+        after = before + 0.05 * torch.randn_like(before)
+        diagnostics = sampled_spectral_diagnostics(
+            before,
+            after,
+            (3, 4),
+            AFMConfig(spectral_diag="sampled", diagnostic_branch="selected_mean"),
+            torch.tensor([0]),
+            1,
+            None,
+        )
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0].branch, "selected_mean")
 
     def test_branch_selection(self):
         idx = selected_branch_indices(4, [1, 0], "positive_only", torch.device("cpu"))
@@ -665,6 +757,24 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(seen["block_index"], 1)
         self.assertEqual(seen["block_path"], "diffusion_model.blocks.1.cross_attn")
         self.assertEqual(seen["stage_tag"], "middle")
+
+    def test_block_metadata_wrapper_exposes_4d_input_shape_candidate(self):
+        original = MetadataEchoCrossAttention()
+        wrapper = AnimaAFMBlockMetadataWrapper(
+            original=original,
+            block_index=0,
+            block_count=3,
+            block_path="diffusion_model.blocks.0.cross_attn",
+        )
+        options = {}
+        x = torch.zeros(2, 36, 64, 8)
+        wrapper(x, transformer_options=options)
+
+        seen = original.seen[0]
+        info = infer_spatial_shape(2304, AFMConfig(spatial_shape_mode="auto"), seen, {})
+        self.assertEqual(info.shape, (36, 64))
+        self.assertEqual(info.source, "runtime_metadata")
+        self.assertNotIn("afm_spatial_shape_candidates", options)
 
     def test_install_anima_block_metadata_wrappers_uses_object_patches(self):
         diffusion_model = FakeDiffusionModel(block_count=3)
@@ -1256,13 +1366,48 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(original.calls, 1)
         self.assertEqual(override.stats.fallback_reasons["mask_shape_unsupported"], 1)
 
+    def test_rectangular_explicit_latent_edits_attention(self):
+        torch.manual_seed(4)
+        q = torch.randn(1, 2, 12, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        config = AFMConfig(
+            strength=0.2,
+            preserve_dc=False,
+            spatial_shape_mode="explicit_latent",
+            latent_width=4,
+            latent_height=3,
+        )
+        override = AnimaAFMAttentionOverride(config)
+        out = override(reference_attention, q, k, v, 2, **self._cfg_kwargs(1.0))
+        baseline = reference_attention(q, k, v, 2, **self._cfg_kwargs(1.0))
+        self.assertEqual(override.stats.edited_calls, 1)
+        self.assertEqual(override.stats.steps[0].shape_counts["q12,k5,h2,d4"], 1)
+        self.assertFalse(torch.allclose(out, baseline))
+
+    def test_rectangular_shape_mismatch_falls_back(self):
+        q = torch.randn(1, 2, 16, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        original = CountingAttention()
+        config = AFMConfig(
+            strength=0.2,
+            spatial_shape_mode="explicit_latent",
+            latent_width=5,
+            latent_height=3,
+        )
+        override = AnimaAFMAttentionOverride(config)
+        override(original, q, k, v, 2, **self._cfg_kwargs(1.0))
+        self.assertEqual(original.calls, 1)
+        self.assertEqual(override.stats.fallback_reasons["spatial_shape_mismatch"], 1)
+
     def test_non_square_falls_back(self):
         q = torch.randn(1, 2, 15, 4)
         k = torch.randn(1, 2, 5, 4)
         v = torch.randn(1, 2, 5, 4)
         override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2))
-        override(reference_attention, q, k, v, 2, skip_reshape=True)
-        self.assertEqual(override.stats.fallback_reasons["cannot_infer_spatial_shape"], 1)
+        override(reference_attention, q, k, v, 2, **self._cfg_kwargs(1.0))
+        self.assertEqual(override.stats.fallback_reasons["spatial_shape_missing"], 1)
 
 
 if __name__ == "__main__":

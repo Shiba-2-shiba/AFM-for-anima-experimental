@@ -25,6 +25,7 @@ ZERO_STRENGTH_MODES = ["original", "observe", "manual"]
 SPECTRAL_DIAG_MODES = ["off", "sampled", "full"]
 DIAGNOSTIC_BRANCHES = ["selected_mean", "positive", "negative", "both_separate"]
 SCOPE_MODES = ["all", "target_call_indices", "block_scope", "encoder_equivalent"]
+SPATIAL_SHAPE_MODES = ["auto", "square_only", "explicit_pixels", "explicit_latent"]
 SUMMARY_ONLY_FALLBACK_REASONS = ("not_cross_attention",)
 TRANSFORMER_METADATA_KEYS = (
     "block",
@@ -37,6 +38,8 @@ TRANSFORMER_METADATA_KEYS = (
     "stage",
     "stage_tag",
     "afm_scope",
+    "afm_spatial_shape",
+    "afm_spatial_shape_candidates",
     "patches_replace",
 )
 
@@ -76,6 +79,13 @@ class AFMConfig:
     diagnostic_top_k: int = 8
     diagnostic_max_batches: int = 1
     diagnostic_max_heads: int = 4
+    spatial_shape_mode: str = "auto"
+    image_width: int = 0
+    image_height: int = 0
+    latent_width: int = 0
+    latent_height: int = 0
+    latent_downscale: int = 16
+    aspect_tolerance: float = 0.001
     max_verbose_fallbacks_per_step_per_reason: int = 3
     fallback_summary_only_reasons: tuple[str, ...] = SUMMARY_ONLY_FALLBACK_REASONS
 
@@ -100,6 +110,8 @@ class AFMConfig:
             raise ValueError(f"Unsupported AFM diagnostic_branch: {self.diagnostic_branch!r}")
         if self.scope_mode not in SCOPE_MODES:
             raise ValueError(f"Unsupported AFM scope_mode: {self.scope_mode!r}")
+        if self.spatial_shape_mode not in SPATIAL_SHAPE_MODES:
+            raise ValueError(f"Unsupported AFM spatial_shape_mode: {self.spatial_shape_mode!r}")
         parse_call_index_scope(self.diagnostic_call_indices)
         parse_call_index_scope(self.target_call_indices)
         if not 0.0 <= self.start_percent <= 1.0:
@@ -124,6 +136,14 @@ class AFMConfig:
             raise ValueError("diagnostic_max_heads must be positive")
         if self.diagnostic_every_n_steps <= 0:
             raise ValueError("diagnostic_every_n_steps must be positive")
+        if self.image_width < 0 or self.image_height < 0:
+            raise ValueError("image_width and image_height must be non-negative")
+        if self.latent_width < 0 or self.latent_height < 0:
+            raise ValueError("latent_width and latent_height must be non-negative")
+        if self.latent_downscale <= 0:
+            raise ValueError("latent_downscale must be positive")
+        if self.aspect_tolerance < 0.0:
+            raise ValueError("aspect_tolerance must be non-negative")
         if self.max_verbose_fallbacks_per_step_per_reason < 0:
             raise ValueError("max_verbose_fallbacks_per_step_per_reason must be non-negative")
 
@@ -251,6 +271,9 @@ class AttentionCallContext:
     query_len: int
     text_len: int
     spatial_shape: tuple[int, int]
+    spatial_shape_source: str
+    spatial_shape_reason: str
+    spatial_shape_aspect_error: float | None
     cond_or_uncond: list[int] | None
     selected: torch.Tensor
     selected_indices: list[int]
@@ -330,11 +353,194 @@ class MemoryEstimate:
         }
 
 
+@dataclass(frozen=True)
+class SpatialShapeInfo:
+    shape: tuple[int, int] | None
+    source: str
+    reason: str
+    aspect_error: float | None = None
+
+
 def infer_square_spatial_shape(query_len: int) -> tuple[int, int] | None:
     side = math.isqrt(int(query_len))
     if side * side != query_len:
         return None
     return side, side
+
+
+def _shape_info(
+    shape: tuple[int, int] | None,
+    source: str,
+    reason: str = "ok",
+    aspect_error: float | None = None,
+) -> SpatialShapeInfo:
+    return SpatialShapeInfo(shape=shape, source=source, reason=reason, aspect_error=aspect_error)
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float) and value.is_integer():
+        int_value = int(value)
+        return int_value if int_value > 0 else None
+    if isinstance(value, str):
+        try:
+            int_value = int(value.strip())
+        except ValueError:
+            return None
+        return int_value if int_value > 0 else None
+    return None
+
+
+def _shape_from_pair(height: Any, width: Any) -> tuple[int, int] | None:
+    parsed_height = _positive_int(height)
+    parsed_width = _positive_int(width)
+    if parsed_height is None or parsed_width is None:
+        return None
+    return parsed_height, parsed_width
+
+
+def _runtime_shape_candidates_from_mapping(
+    query_len: int,
+    mapping: dict[str, Any] | None,
+) -> tuple[list[tuple[int, int]], bool]:
+    if not isinstance(mapping, dict):
+        return [], False
+
+    query_len = int(query_len)
+    candidates: list[tuple[int, int]] = []
+    invalid_strict_metadata = False
+    key_pairs = (
+        ("afm_latent_height", "afm_latent_width", True),
+        ("afm_spatial_height", "afm_spatial_width", True),
+        ("latent_height", "latent_width", True),
+        ("spatial_height", "spatial_width", True),
+        ("height", "width", False),
+    )
+    for height_key, width_key, strict in key_pairs:
+        shape = _shape_from_pair(mapping.get(height_key), mapping.get(width_key))
+        if shape is None:
+            continue
+        if shape[0] * shape[1] == query_len:
+            candidates.append(shape)
+        elif strict:
+            invalid_strict_metadata = True
+
+    for key in ("afm_spatial_shape", "spatial_shape", "latent_shape"):
+        value = mapping.get(key)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            shape = _shape_from_pair(value[0], value[1])
+            if shape is None:
+                continue
+            if shape[0] * shape[1] == query_len:
+                candidates.append(shape)
+            else:
+                invalid_strict_metadata = True
+        elif isinstance(value, dict):
+            nested_candidates, nested_invalid = _runtime_shape_candidates_from_mapping(query_len, value)
+            candidates.extend(nested_candidates)
+            invalid_strict_metadata = invalid_strict_metadata or nested_invalid
+
+    candidate_values = mapping.get("afm_spatial_shape_candidates")
+    if isinstance(candidate_values, list):
+        for value in candidate_values:
+            if isinstance(value, dict):
+                nested_candidates, nested_invalid = _runtime_shape_candidates_from_mapping(query_len, value)
+                candidates.extend(nested_candidates)
+                invalid_strict_metadata = invalid_strict_metadata or nested_invalid
+            elif isinstance(value, (list, tuple)) and len(value) == 2:
+                shape = _shape_from_pair(value[0], value[1])
+                if shape is not None and shape[0] * shape[1] == query_len:
+                    candidates.append(shape)
+
+    return candidates, invalid_strict_metadata
+
+
+def _runtime_shape_from_mapping(query_len: int, mapping: dict[str, Any] | None) -> SpatialShapeInfo | None:
+    candidates, invalid_strict_metadata = _runtime_shape_candidates_from_mapping(query_len, mapping)
+    unique_shapes = list(dict.fromkeys(candidates))
+    if len(unique_shapes) == 1:
+        return _shape_info(unique_shapes[0], "runtime_metadata")
+    if len(unique_shapes) > 1:
+        return _shape_info(None, "runtime_metadata", "spatial_shape_ambiguous")
+    if invalid_strict_metadata:
+        return _shape_info(None, "runtime_metadata", "spatial_shape_metadata_invalid")
+    return None
+
+
+def _closest_aspect_factor_shape(query_len: int, target_aspect: float) -> tuple[tuple[int, int], float]:
+    query_len = int(query_len)
+    best_shape = (1, query_len)
+    best_error = float("inf")
+    for height in range(1, math.isqrt(query_len) + 1):
+        if query_len % height != 0:
+            continue
+        width = query_len // height
+        for candidate_height, candidate_width in ((height, width), (width, height)):
+            aspect = candidate_width / candidate_height
+            error = abs(aspect - target_aspect) / max(target_aspect, 1e-8)
+            if error < best_error:
+                best_shape = (candidate_height, candidate_width)
+                best_error = error
+    return best_shape, best_error
+
+
+def _explicit_latent_spatial_shape(query_len: int, config: AFMConfig) -> SpatialShapeInfo:
+    if config.latent_width <= 0 or config.latent_height <= 0:
+        return _shape_info(None, "none", "spatial_shape_missing")
+    shape = (int(config.latent_height), int(config.latent_width))
+    if shape[0] * shape[1] != int(query_len):
+        return _shape_info(None, "none", "spatial_shape_mismatch")
+    return _shape_info(shape, "explicit_latent")
+
+
+def _explicit_pixels_spatial_shape(query_len: int, config: AFMConfig) -> SpatialShapeInfo:
+    if config.image_width <= 0 or config.image_height <= 0:
+        return _shape_info(None, "none", "spatial_shape_missing")
+
+    width = int(config.image_width)
+    height = int(config.image_height)
+    downscale = int(config.latent_downscale)
+    if width % downscale == 0 and height % downscale == 0:
+        latent_width = width // downscale
+        latent_height = height // downscale
+        if latent_width * latent_height == int(query_len):
+            return _shape_info((latent_height, latent_width), "explicit_pixels_downscale")
+
+    target_aspect = width / height
+    shape, aspect_error = _closest_aspect_factor_shape(int(query_len), target_aspect)
+    if aspect_error <= float(config.aspect_tolerance):
+        return _shape_info(shape, "explicit_pixels_aspect", aspect_error=aspect_error)
+    return _shape_info(None, "none", "spatial_shape_mismatch", aspect_error=aspect_error)
+
+
+def infer_spatial_shape(
+    query_len: int,
+    config: AFMConfig,
+    transformer_options: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> SpatialShapeInfo:
+    mode = config.spatial_shape_mode
+    if mode == "explicit_latent":
+        return _explicit_latent_spatial_shape(query_len, config)
+    if mode == "explicit_pixels":
+        return _explicit_pixels_spatial_shape(query_len, config)
+    if mode == "square_only":
+        square = infer_square_spatial_shape(query_len)
+        if square is None:
+            return _shape_info(None, "none", "spatial_shape_missing")
+        return _shape_info(square, "square_legacy")
+
+    for mapping in (metadata, transformer_options):
+        runtime_shape = _runtime_shape_from_mapping(query_len, mapping)
+        if runtime_shape is not None:
+            return runtime_shape
+    square = infer_square_spatial_shape(query_len)
+    if square is not None:
+        return _shape_info(square, "square_legacy")
+    return _shape_info(None, "none", "spatial_shape_missing")
 
 
 def progress_from_sigmas(transformer_options: dict[str, Any]) -> ProgressInfo | None:
@@ -659,6 +865,58 @@ def stage_tag_for_block(block_index: int, block_count: int) -> str:
     return "late"
 
 
+def _candidate_record(source: str, shape: tuple[int, int]) -> dict[str, Any]:
+    return {
+        "source": source,
+        "afm_spatial_shape": [int(shape[0]), int(shape[1])],
+    }
+
+
+def _append_unique_shape_candidate(
+    candidates: list[dict[str, Any]],
+    seen_shapes: set[tuple[int, int]],
+    source: str,
+    height: Any,
+    width: Any,
+) -> None:
+    shape = _shape_from_pair(height, width)
+    if shape is None or shape in seen_shapes:
+        return
+    seen_shapes.add(shape)
+    candidates.append(_candidate_record(source, shape))
+
+
+def _spatial_shape_candidates_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen_shapes: set[tuple[int, int]] = set()
+    x = args[0] if args and torch.is_tensor(args[0]) else kwargs.get("x")
+    if torch.is_tensor(x) and x.ndim == 4:
+        _append_unique_shape_candidate(candidates, seen_shapes, "x_middle_hw", x.shape[1], x.shape[2])
+        _append_unique_shape_candidate(candidates, seen_shapes, "x_last_hw", x.shape[-2], x.shape[-1])
+
+    rope_emb = kwargs.get("rope_emb")
+    if isinstance(rope_emb, dict):
+        for key in ("afm_spatial_shape", "spatial_shape", "latent_shape"):
+            value = rope_emb.get(key)
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                _append_unique_shape_candidate(candidates, seen_shapes, f"rope_emb:{key}", value[0], value[1])
+        _append_unique_shape_candidate(
+            candidates,
+            seen_shapes,
+            "rope_emb:latent_hw",
+            rope_emb.get("latent_height"),
+            rope_emb.get("latent_width"),
+        )
+        _append_unique_shape_candidate(
+            candidates,
+            seen_shapes,
+            "rope_emb:spatial_hw",
+            rope_emb.get("spatial_height"),
+            rope_emb.get("spatial_width"),
+        )
+    return candidates
+
+
 class AnimaAFMBlockMetadataWrapper(nn.Module):
     def __init__(self, original: nn.Module, block_index: int, block_count: int, block_path: str):
         super().__init__()
@@ -688,6 +946,13 @@ class AnimaAFMBlockMetadataWrapper(nn.Module):
             "stage_tag": self.stage_tag,
             "afm_scope": self.stage_tag,
         }
+        shape_candidates = _spatial_shape_candidates_from_call(args, kwargs)
+        if shape_candidates:
+            existing_candidates = transformer_options.get("afm_spatial_shape_candidates")
+            if isinstance(existing_candidates, list):
+                patch_values["afm_spatial_shape_candidates"] = [*existing_candidates, *shape_candidates]
+            else:
+                patch_values["afm_spatial_shape_candidates"] = shape_candidates
         previous = {key: transformer_options.get(key, None) for key in patch_values}
         missing = {key for key in patch_values if key not in transformer_options}
         transformer_options.update(patch_values)
@@ -1141,6 +1406,17 @@ class AnimaAFMAttentionOverride:
             })
         return record
 
+    def _spatial_config_record(self) -> dict[str, Any]:
+        return {
+            "spatial_shape_mode": self.config.spatial_shape_mode,
+            "image_width": int(self.config.image_width),
+            "image_height": int(self.config.image_height),
+            "latent_width": int(self.config.latent_width),
+            "latent_height": int(self.config.latent_height),
+            "latent_downscale": int(self.config.latent_downscale),
+            "aspect_tolerance": float(self.config.aspect_tolerance),
+        }
+
     def _summarize_transformer_options(self, transformer_options: dict[str, Any]) -> dict[str, Any]:
         summary: dict[str, Any] = {}
         for key in list(transformer_options.keys())[:24]:
@@ -1199,6 +1475,9 @@ class AnimaAFMAttentionOverride:
             "k_shape": list(context.k.shape),
             "v_shape": list(context.v.shape),
             "spatial_shape": list(context.spatial_shape),
+            "spatial_shape_source": context.spatial_shape_source,
+            "spatial_shape_reason": context.spatial_shape_reason,
+            "spatial_shape_aspect_error": context.spatial_shape_aspect_error,
             "text_len": context.text_len,
             "target_call_selected": context.target_call_selected,
             "scope_mode": self.config.scope_mode,
@@ -1209,6 +1488,7 @@ class AnimaAFMAttentionOverride:
             "fallback_reason": identity.fallback_reason,
             "metadata": context.metadata,
         })
+        record.update(self._spatial_config_record())
         self._emit_jsonl(record)
 
     def _spectral_summary(self, step: StepStats) -> dict[str, Any]:
@@ -1370,9 +1650,6 @@ class AnimaAFMAttentionOverride:
         text_len = int(k.shape[-2])
         if query_len == text_len:
             raise AFMFallback("not_cross_attention")
-        spatial_shape = infer_square_spatial_shape(query_len)
-        if spatial_shape is None:
-            raise AFMFallback("cannot_infer_spatial_shape")
         if progress is None:
             raise AFMFallback("missing_sigmas")
         if progress.progress < self.config.start_percent or progress.progress > self.config.end_percent:
@@ -1392,6 +1669,10 @@ class AnimaAFMAttentionOverride:
         step = self._step_for(progress)
         eligible_call_index = step.eligible_calls
         block_id, metadata = discover_transformer_metadata(transformer_options)
+        spatial_info = infer_spatial_shape(query_len, self.config, transformer_options, metadata)
+        if spatial_info.shape is None:
+            raise AFMFallback(spatial_info.reason)
+        spatial_shape = spatial_info.shape
         scope_identity = scope_identity_from_metadata(block_id, metadata)
         scope_selection = self._scope_matcher.select(scope_identity)
         step.eligible_calls += 1
@@ -1426,6 +1707,9 @@ class AnimaAFMAttentionOverride:
             query_len=query_len,
             text_len=text_len,
             spatial_shape=spatial_shape,
+            spatial_shape_source=spatial_info.source,
+            spatial_shape_reason=spatial_info.reason,
+            spatial_shape_aspect_error=spatial_info.aspect_error,
             cond_or_uncond=cond_or_uncond,
             selected=selected,
             selected_indices=selected_indices,
@@ -1655,6 +1939,9 @@ class AnimaAFMAttentionOverride:
             k=context.k,
             v=context.v,
             spatial_shape=context.spatial_shape,
+            spatial_shape_source=context.spatial_shape_source,
+            spatial_shape_reason=context.spatial_shape_reason,
+            spatial_shape_aspect_error=context.spatial_shape_aspect_error,
             alpha_lf=alpha_lf,
             alpha_hf=alpha_hf,
             entropy_value=entropy_value,
@@ -1718,9 +2005,15 @@ class AnimaAFMAttentionOverride:
             self._emit_text("%s fallback reason=%s%s", LOG_PREFIX, reason, shapes)
             transformer_options = kwargs.get("transformer_options") or {}
             spatial_shape = None
+            spatial_shape_source = "none"
+            spatial_shape_reason = reason
+            spatial_shape_aspect_error = None
             if torch.is_tensor(q):
-                spatial = infer_square_spatial_shape(int(q.shape[-2]))
-                spatial_shape = None if spatial is None else list(spatial)
+                spatial_info = infer_spatial_shape(int(q.shape[-2]), self.config, transformer_options, {})
+                spatial_shape = None if spatial_info.shape is None else list(spatial_info.shape)
+                spatial_shape_source = spatial_info.source
+                spatial_shape_reason = spatial_info.reason
+                spatial_shape_aspect_error = spatial_info.aspect_error
             record = self._record_base("fallback", progress)
             record.update({
                 "reason": reason,
@@ -1729,6 +2022,9 @@ class AnimaAFMAttentionOverride:
                 "k_shape": k_shape,
                 "v_shape": v_shape,
                 "spatial_shape": spatial_shape,
+                "spatial_shape_source": spatial_shape_source,
+                "spatial_shape_reason": spatial_shape_reason,
+                "spatial_shape_aspect_error": spatial_shape_aspect_error,
                 "cond_or_uncond": transformer_options.get("cond_or_uncond"),
                 "branch_mode": self.config.branch_mode,
                 "selected_indices": [],
@@ -1741,6 +2037,7 @@ class AnimaAFMAttentionOverride:
                 "estimated_logits_mib": None,
                 "estimated_peak_mib": None,
             })
+            record.update(self._spatial_config_record())
             self._emit_jsonl(record)
         return original_func(*args, **kwargs)
 
@@ -1767,6 +2064,9 @@ class AnimaAFMAttentionOverride:
         k: torch.Tensor,
         v: torch.Tensor,
         spatial_shape: tuple[int, int],
+        spatial_shape_source: str | None,
+        spatial_shape_reason: str | None,
+        spatial_shape_aspect_error: float | None,
         alpha_lf: float | None,
         alpha_hf: float | None,
         entropy_value: float | None,
@@ -1806,6 +2106,9 @@ class AnimaAFMAttentionOverride:
                 k=k,
                 v=v,
                 spatial_shape=spatial_shape,
+                spatial_shape_source=spatial_shape_source,
+                spatial_shape_reason=spatial_shape_reason,
+                spatial_shape_aspect_error=spatial_shape_aspect_error,
                 alpha_lf=alpha_lf,
                 alpha_hf=alpha_hf,
                 entropy_value=entropy_value,
@@ -1833,6 +2136,9 @@ class AnimaAFMAttentionOverride:
                 k=k,
                 v=v,
                 spatial_shape=spatial_shape,
+                spatial_shape_source=spatial_shape_source,
+                spatial_shape_reason=spatial_shape_reason,
+                spatial_shape_aspect_error=spatial_shape_aspect_error,
                 selected=selected,
                 cond_or_uncond=cond_or_uncond,
                 alpha_lf=alpha_lf,
@@ -1860,6 +2166,9 @@ class AnimaAFMAttentionOverride:
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
         spatial_shape: tuple[int, int] | None = None,
+        spatial_shape_source: str | None = None,
+        spatial_shape_reason: str | None = None,
+        spatial_shape_aspect_error: float | None = None,
         alpha_lf: float | None = None,
         alpha_hf: float | None = None,
         entropy_value: float | None = None,
@@ -1901,7 +2210,7 @@ class AnimaAFMAttentionOverride:
             "%s %s step_index=%s num_steps=%s last_index=%s u=%.4f sigma=%.6g "
             "snapshot_reason=%s snapshot_call_index=%s mode=%s calls=%s eligible=%s edited=%s observed=%s "
             "target_skipped=%s fallbacks=%s fallback_reasons=%s fallback_suppressed_reasons=%s eligible_call_indices=%s "
-            "eligible_call_index=%s block_id=%s metadata=%s q=%s k=%s v=%s spatial=%s shapes=%s "
+            "eligible_call_index=%s block_id=%s metadata=%s q=%s k=%s v=%s spatial=%s spatial_source=%s shapes=%s "
             "cond_or_uncond=%s branch_mode=%s selected_indices=%s selected_count=%s batch=%s "
             "strength=%.4f cutoff=%.4f alpha_lf=%s alpha_hf=%s entropy=%s gqa=%s "
             "estimated_logits_mib=%s estimated_peak_mib=%s max_estimated_logits_mib=%.1f max_peak_mib=%.1f "
@@ -1935,6 +2244,7 @@ class AnimaAFMAttentionOverride:
             k_shape,
             v_shape,
             spatial_shape,
+            spatial_shape_source,
             shape_summary,
             cond_or_uncond,
             self.config.branch_mode,
@@ -1989,6 +2299,9 @@ class AnimaAFMAttentionOverride:
             "k_shape": None if k is None else list(k.shape),
             "v_shape": None if v is None else list(v.shape),
             "spatial_shape": None if spatial_shape is None else list(spatial_shape),
+            "spatial_shape_source": spatial_shape_source,
+            "spatial_shape_reason": spatial_shape_reason,
+            "spatial_shape_aspect_error": spatial_shape_aspect_error,
             "shape_counts": _counter_dict(step.shape_counts),
             "cond_or_uncond": cond_or_uncond,
             "branch_mode": self.config.branch_mode,
@@ -2033,6 +2346,7 @@ class AnimaAFMAttentionOverride:
             "diagnostic_include_unselected": self.config.diagnostic_include_unselected,
             "max_logit_delta": logits_delta,
         })
+        record.update(self._spatial_config_record())
         record.update(spectral_summary)
         self._emit_jsonl(record)
 
@@ -2046,6 +2360,9 @@ class AnimaAFMAttentionOverride:
         k: torch.Tensor,
         v: torch.Tensor,
         spatial_shape: tuple[int, int],
+        spatial_shape_source: str | None,
+        spatial_shape_reason: str | None,
+        spatial_shape_aspect_error: float | None,
         selected: torch.Tensor,
         cond_or_uncond: list[int] | None,
         alpha_lf: float | None,
@@ -2103,6 +2420,9 @@ class AnimaAFMAttentionOverride:
             "k_shape": list(k.shape),
             "v_shape": list(v.shape),
             "spatial_shape": list(spatial_shape),
+            "spatial_shape_source": spatial_shape_source,
+            "spatial_shape_reason": spatial_shape_reason,
+            "spatial_shape_aspect_error": spatial_shape_aspect_error,
             "cond_or_uncond": cond_or_uncond,
             "branch_mode": self.config.branch_mode,
             "edit_selected_indices": edit_selected_indices,
@@ -2123,6 +2443,7 @@ class AnimaAFMAttentionOverride:
             "estimated_peak_mib": estimated_peak_mib,
             "memory_estimate": self._memory_estimate_for_log(q, k, selected, estimated_logits_mib, estimated_peak_mib),
         })
+        record.update(self._spatial_config_record())
         self._emit_jsonl(record)
 
     def _diagnostic_mode(self, call_mode: str, diagnostic: SpectralDiagnostic) -> str:
