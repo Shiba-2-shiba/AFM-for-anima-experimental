@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -12,7 +13,9 @@ FIELDNAMES = [
     "schema_version",
     "record_type",
     "run_id",
+    "run_completion_json",
     "step_index",
+    "model_evaluation_index",
     "num_steps",
     "last_index",
     "u",
@@ -57,6 +60,23 @@ FIELDNAMES = [
     "estimated_logits_mib",
     "estimated_peak_mib",
     "memory_estimate_json",
+    "metric_defined",
+    "metric_undefined_reason",
+    "rho_definition",
+    "rho_centering",
+    "rho_raw_before",
+    "rho_raw_after",
+    "rho_centered_before",
+    "rho_centered_after",
+    "spatial_shape",
+    "q_shape",
+    "k_shape",
+    "v_shape",
+    "cutoff",
+    "spectral_diag",
+    "diagnostic_top_k",
+    "diagnostic_max_batches",
+    "diagnostic_max_heads",
 ]
 
 
@@ -66,19 +86,25 @@ def _json_cell(value: Any) -> Any:
     return value
 
 
+def _reject_constant(value: str) -> None:
+    raise ValueError(f"Non-finite JSON number: {value}")
+
+
 def iter_json_records(lines: Iterable[str], strict: bool = False) -> Iterable[dict[str, Any]]:
     for line in lines:
         line = line.strip()
         if not line:
             continue
         try:
-            record = json.loads(line)
+            record = json.loads(line, parse_constant=_reject_constant) if strict else json.loads(line)
         except json.JSONDecodeError:
             if strict:
                 raise
             continue
         if isinstance(record, dict):
             yield record
+        elif strict:
+            raise ValueError("JSONL records must be objects")
 
 
 def infer_diagnostic_mode(record: dict[str, Any], call_mode: str) -> str:
@@ -100,7 +126,7 @@ def record_to_row(record: dict[str, Any]) -> dict[str, Any]:
     call_mode = record.get("call_mode") or record.get("mode")
     diagnostic_mode = infer_diagnostic_mode(record, str(call_mode))
     edit_selected = record.get("edit_selected_indices", record.get("selected_indices", []))
-    diagnostic_batches = record.get("diagnostic_batch_indices", record.get("batch_indices", []))
+    diagnostic_batches = record.get("diagnostic_batch_indices", record.get("batch_indices"))
     selected_indices = record.get("selected_indices", edit_selected)
     batch_indices = record.get("batch_indices", diagnostic_batches)
     delta_rho = record.get("delta_rho")
@@ -109,6 +135,7 @@ def record_to_row(record: dict[str, Any]) -> dict[str, Any]:
         "record_type": record.get("record_type"),
         "run_id": record.get("run_id"),
         "step_index": record.get("step_index"),
+        "model_evaluation_index": record.get("model_evaluation_index"),
         "num_steps": record.get("num_steps"),
         "last_index": record.get("last_index"),
         "u": record.get("u"),
@@ -153,6 +180,15 @@ def record_to_row(record: dict[str, Any]) -> dict[str, Any]:
         "estimated_logits_mib": record.get("estimated_logits_mib"),
         "estimated_peak_mib": record.get("estimated_peak_mib"),
         "memory_estimate_json": _json_cell(record.get("memory_estimate")),
+        "metric_defined": record.get("metric_defined"),
+        "metric_undefined_reason": record.get("metric_undefined_reason"),
+        "rho_definition": record.get("rho_definition") or "legacy_unspecified",
+        "rho_centering": record.get("rho_centering") or "unknown",
+        **{key: _json_cell(record.get(key)) for key in (
+            "rho_raw_before", "rho_raw_after", "rho_centered_before", "rho_centered_after",
+            "spatial_shape", "q_shape", "k_shape", "v_shape", "cutoff", "spectral_diag",
+            "diagnostic_top_k", "diagnostic_max_batches", "diagnostic_max_heads",
+        )},
     }
 
 
@@ -162,10 +198,47 @@ def parse_records(
     include_summaries: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    terminals: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    after_terminal: set[str] = set()
     for record in records:
         current_type = record.get("record_type")
+        run_id = str(record.get("run_id"))
+        if current_type == "run_final_summary":
+            terminals[run_id].append(record)
+        elif current_type == "spectral_diag" and terminals.get(run_id):
+            after_terminal.add(run_id)
         if current_type == record_type or (include_summaries and current_type in {"step_snapshot", "step_final_summary", "run_final_summary", "fallback"}):
             rows.append(record_to_row(record))
+    for row in rows:
+        run_id = str(row.get("run_id"))
+        completed = terminals.get(run_id, [])
+        if not completed:
+            row["run_completion_json"] = None
+            continue
+        final = completed[-1]
+        steps = final.get("steps")
+        step_counts = None
+        if isinstance(steps, dict):
+            step_counts = {}
+            for step, info in steps.items():
+                if not isinstance(info, dict):
+                    step_counts[str(step)] = None
+                elif "spectral_emitted_count" in info:
+                    step_counts[str(step)] = info["spectral_emitted_count"]
+                else:
+                    defined, undefined = info.get("spectral_diag_count"), info.get("spectral_undefined_count", 0)
+                    step_counts[str(step)] = defined + undefined if type(defined) is int and type(undefined) is int else None
+        row["run_completion_json"] = _json_cell({
+            "run_id": final.get("run_id"), "terminal_record_count": len(completed),
+            "sampling_status": final.get("sampling_status"),
+            "sampling_error_type": final.get("sampling_error_type"),
+            "telemetry_errors": final.get("telemetry_errors"),
+            "fallback_reasons": final.get("fallback_reasons"),
+            "fallbacks": final.get("fallbacks"),
+            "last_step_index": final.get("last_step_index"),
+            "spectral_emitted_counts_by_step": step_counts,
+            "diagnostics_after_terminal": run_id in after_terminal,
+        })
     return rows
 
 
@@ -201,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             include_summaries=args.include_summaries,
             strict=args.strict,
         )
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:
         print(f"Malformed JSONL: {exc}", file=sys.stderr)
         return 2
 

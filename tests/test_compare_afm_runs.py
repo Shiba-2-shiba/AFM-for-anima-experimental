@@ -32,7 +32,7 @@ class CompareAFMRunsTests(unittest.TestCase):
         self.assertEqual(summary["duplicate_observe_pairs"], 1)
         self.assertEqual(summary["duplicate_edit_pairs"], 1)
         self.assertEqual(summary["unmatched_observe_pairs"], 1)
-        self.assertEqual(summary["pair_key_columns"], ["step_index", "eligible_call_index", "branch"])
+        self.assertEqual(summary["pair_key_columns"], ["step_index", "model_evaluation_index", "eligible_call_index", "block_id", "block_path", "branch"])
 
     def test_fail_flags_for_duplicates_and_unmatched_observe(self):
         observe_records = [

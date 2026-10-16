@@ -1,5 +1,7 @@
 # Anima AFM 非正方形対応 タスク
 
+> 2026-10-16 注記: 以下のチェック状態は 2026-06 時点の履歴です。修正後の `auto`、sampling lifecycle、guard、解析の実機検証を完了扱いにするものではありません。現在版の GPU/ComfyUI 検証は未実施です。[新しい実機検証計画](../hardware-validation-plan-ja.md)に沿って別の結果を記録してください。
+
 最終更新: 2026-06-28
 
 ## Phase 0: 設計と観測

@@ -1,5 +1,7 @@
 # ComfyUI Anima AFM
 
+**2026-10-16 correctness update:** CPU validation: 167 tests and 43 subtests passed. GPU/ComfyUI inference remains unverified for this revision. See [CPU verification](docs/cpu-validation-2026-10-16.md) and [hardware validation plan](docs/hardware-validation-plan-ja.md).
+
 Experimental ComfyUI custom node for Attention Frequency Modulation (AFM) on Anima/Cosmos DiT cross-attention.
 
 This node is Anima-only. It does not implement a Stable Diffusion 1.5 U-Net path.
@@ -11,6 +13,8 @@ This node is Anima-only. It does not implement a Stable Diffusion 1.5 U-Net path
 Connect it after the Anima model loader and before sampling.
 
 ## Initial Validation
+
+For the post-fix hardware protocol, controls, failure gates, and blinded multi-seed quality evaluation, see [the Japanese hardware validation plan](docs/hardware-validation-plan-ja.md). This is a plan, not a claim of completed GPU/ComfyUI validation. Historical logs and image examples do not validate the current revision.
 
 Use a fixed seed, fixed prompt, fixed sampler, and fixed latent.
 
@@ -52,10 +56,12 @@ Schema v2 separates fields that were ambiguous in earlier logs:
 - `edit_selected_indices` is the batch slice eligible for editing. Legacy `selected_indices` remains as its alias.
 - `diagnostic_batch_indices` is the batch slice measured by that spectral row. Legacy `batch_indices` remains as its alias.
 - `edit_applied=false` on an unselected branch means the branch was measured, not edited.
-- `rho` is the high-frequency ratio of a post-softmax top-K concentration map. It is not a direct image-frequency measurement.
+- Current `rho` is the high-frequency energy ratio of a spatially mean-centered post-softmax top-K concentration map. Metric definition/centering and undefined-energy status are recorded explicitly. It is not a direct image-frequency measurement; do not mix it with historical logs whose metric definition is unspecified.
 - `delta_rho_local = rho_after - rho_before` within one run. `delta_rho_vs_observe = rho_edit_after - rho_observe` is produced by compare against an observe baseline.
 
 Use `scripts/parse_anima_afm_log.py` to extract spectral diagnostic rows from JSONL, and `scripts/compare_afm_runs.py` to compare observe-vs-edit rho trajectories by `step_index`, `eligible_call_index`, and branch. Both scripts keep legacy v1 JSONL/CSV compatibility.
+
+The examples below support historical exploratory analysis. New validation datasets should use manifest-backed `--strict-validation`, model-evaluation and block identity, and matching metric definitions; see the [hardware plan's analysis commands](docs/hardware-validation-plan-ja.md#6-診断解析と-fail-closed-な証拠). Legacy logs without provenance remain unverified.
 
 ```bash
 python scripts/parse_anima_afm_log.py logs/observe.jsonl --format csv > out/observe.csv
@@ -137,11 +143,14 @@ debug_format=both
 
 ## Limits
 
-- Square image query grids are still the automatic compatibility path.
+- `auto` requires trusted runtime H/W metadata, even when the query-token count is a perfect square. Missing, invalid, or ambiguous shape information falls back to the original attention. A rectangular `36 x 64` grid also has a square token count (2304); token count alone does not identify topology.
+- `square_only` explicitly opts into legacy square inference. Use it only when the caller independently guarantees a square query grid.
 - Static non-square images are supported when the shape is explicit: set `spatial_shape_mode=explicit_pixels` with matching `image_width` / `image_height`, or `spatial_shape_mode=explicit_latent` with matching `latent_width` / `latent_height`.
 - Without explicit dimensions or trusted runtime metadata, non-square layouts fall back to the original attention instead of guessing. Conflicting runtime shape candidates are rejected with `spatial_shape_ambiguous`.
-- Current Anima runtime checks did not expose a reliable non-square shape candidate to `auto`; use `explicit_pixels` for 16:9, 9:16, and other non-square static images.
+- On compatible ComfyUI versions, the `post_input` hook records the actual Anima/Cosmos query grid for `auto`. Historical runs without this hook lacked reliable non-square metadata; the current hook still requires hardware validation. Use correct explicit dimensions when trusted runtime metadata is unavailable.
+- The AFM spatial hook must run after hooks that change the image grid. Shape-changing hooks that run later are unsupported.
 - Video or time-folded query layouts are not supported yet.
+- Parallel multi-GPU evaluation is unsupported. Sampling requires the compatible ComfyUI `OUTER_SAMPLE` / `APPLY_MODEL` / `post_input` contracts; see `AFM_COMFYUI_SOURCE_ROOT` in the hardware plan for optional source-contract tests.
 - If another node already installs `optimized_attention_override`, this node raises a clear error.
-- Full pre-softmax logits are materialized for edited calls. `max_logits_mib` guards logits allocation and `max_peak_mib` guards the conservative full-FFT peak estimate until a later chunked implementation exists.
+- Full pre-softmax logits are materialized for edited calls. `max_logits_mib` and `max_peak_mib` guard attention and diagnostic allocations using tensor-lifetime estimates. These are lower-bound-oriented estimates, not a hard total-VRAM ceiling; model weights, allocator behavior, and FFT/backend workspaces still require hardware validation and VRAM headroom.
 

@@ -14,6 +14,7 @@ import torch.nn as nn
 
 LOGGER = logging.getLogger(__name__)
 LOG_PREFIX = "[AnimaAFM]"
+_AFM_CROSS_ATTENTION = object()
 
 SCHEDULES = ["curve", "lf_only", "hf_only", "constant"]
 BRANCH_MODES = ["both", "positive_only", "negative_only"]
@@ -90,6 +91,9 @@ class AFMConfig:
     fallback_summary_only_reasons: tuple[str, ...] = SUMMARY_ONLY_FALLBACK_REASONS
 
     def validate(self) -> None:
+        for name in ("strength", "cutoff", "start_percent", "end_percent", "beta", "gamma", "mask_width", "max_logits_mib", "max_peak_mib", "aspect_tolerance"):
+            if not math.isfinite(float(getattr(self, name))):
+                raise ValueError(f"{name} must be finite")
         if self.mode not in AFM_MODES:
             raise ValueError(f"Unsupported AFM mode: {self.mode!r}")
         if self.schedule not in SCHEDULES:
@@ -158,6 +162,8 @@ class SpectralDiagnostic:
     attn_delta_mean: float
     attn_delta_max: float
     edit_applied: bool = True
+    metric_defined: bool = True
+    metric_undefined_reason: str | None = None
 
 
 @dataclass
@@ -333,7 +339,7 @@ class MemoryEstimate:
     softmax_probs_mib: float
     peak_multiplier: float
     estimated_peak_mib: float
-    method: str = "conservative_full_fft_multiplier"
+    method: str = "live_tensor_lifetime_estimate_workspace_excluded"
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -422,6 +428,8 @@ def _runtime_shape_candidates_from_mapping(
     for height_key, width_key, strict in key_pairs:
         shape = _shape_from_pair(mapping.get(height_key), mapping.get(width_key))
         if shape is None:
+            if strict and (height_key in mapping or width_key in mapping):
+                invalid_strict_metadata = True
             continue
         if shape[0] * shape[1] == query_len:
             candidates.append(shape)
@@ -433,6 +441,7 @@ def _runtime_shape_candidates_from_mapping(
         if isinstance(value, (list, tuple)) and len(value) == 2:
             shape = _shape_from_pair(value[0], value[1])
             if shape is None:
+                invalid_strict_metadata = True
                 continue
             if shape[0] * shape[1] == query_len:
                 candidates.append(shape)
@@ -441,7 +450,9 @@ def _runtime_shape_candidates_from_mapping(
         elif isinstance(value, dict):
             nested_candidates, nested_invalid = _runtime_shape_candidates_from_mapping(query_len, value)
             candidates.extend(nested_candidates)
-            invalid_strict_metadata = invalid_strict_metadata or nested_invalid
+            invalid_strict_metadata = invalid_strict_metadata or nested_invalid or not nested_candidates
+        elif key in mapping:
+            invalid_strict_metadata = True
 
     candidate_values = mapping.get("afm_spatial_shape_candidates")
     if isinstance(candidate_values, list):
@@ -449,11 +460,18 @@ def _runtime_shape_candidates_from_mapping(
             if isinstance(value, dict):
                 nested_candidates, nested_invalid = _runtime_shape_candidates_from_mapping(query_len, value)
                 candidates.extend(nested_candidates)
-                invalid_strict_metadata = invalid_strict_metadata or nested_invalid
+                invalid_strict_metadata = invalid_strict_metadata or nested_invalid or not nested_candidates
             elif isinstance(value, (list, tuple)) and len(value) == 2:
                 shape = _shape_from_pair(value[0], value[1])
                 if shape is not None and shape[0] * shape[1] == query_len:
                     candidates.append(shape)
+                else:
+                    invalid_strict_metadata = True
+
+            else:
+                invalid_strict_metadata = True
+    elif "afm_spatial_shape_candidates" in mapping:
+        invalid_strict_metadata = True
 
     return candidates, invalid_strict_metadata
 
@@ -461,6 +479,8 @@ def _runtime_shape_candidates_from_mapping(
 def _runtime_shape_from_mapping(query_len: int, mapping: dict[str, Any] | None) -> SpatialShapeInfo | None:
     candidates, invalid_strict_metadata = _runtime_shape_candidates_from_mapping(query_len, mapping)
     unique_shapes = list(dict.fromkeys(candidates))
+    if invalid_strict_metadata:
+        return _shape_info(None, "runtime_metadata", "spatial_shape_metadata_invalid")
     if len(unique_shapes) == 1:
         return _shape_info(unique_shapes[0], "runtime_metadata")
     if len(unique_shapes) > 1:
@@ -522,24 +542,45 @@ def infer_spatial_shape(
     transformer_options: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> SpatialShapeInfo:
+    if any(isinstance(m, dict) and m.get("afm_spatial_shape_invalid") for m in (metadata, transformer_options)):
+        return _shape_info(None, "runtime_metadata", "unsupported_spatial_layout")
     mode = config.spatial_shape_mode
-    if mode == "explicit_latent":
-        return _explicit_latent_spatial_shape(query_len, config)
-    if mode == "explicit_pixels":
-        return _explicit_pixels_spatial_shape(query_len, config)
+    if mode in ("explicit_latent", "explicit_pixels"):
+        explicit = _explicit_latent_spatial_shape(query_len, config) if mode == "explicit_latent" else _explicit_pixels_spatial_shape(query_len, config)
+        if explicit.shape is None:
+            return explicit
+        for mapping in (metadata, transformer_options):
+            runtime = _runtime_shape_from_mapping(query_len, mapping)
+            if runtime is not None:
+                if runtime.shape is None:
+                    return runtime
+                if runtime.shape != explicit.shape:
+                    return _shape_info(None, "runtime_metadata", "spatial_shape_ambiguous")
+        return explicit
     if mode == "square_only":
         square = infer_square_spatial_shape(query_len)
         if square is None:
             return _shape_info(None, "none", "spatial_shape_missing")
+        for mapping in (metadata, transformer_options):
+            runtime = _runtime_shape_from_mapping(query_len, mapping)
+            if runtime is not None:
+                if runtime.shape is None:
+                    return runtime
+                if runtime.shape != square:
+                    return _shape_info(None, "runtime_metadata", "spatial_shape_ambiguous")
         return _shape_info(square, "square_legacy")
 
+    found = []
     for mapping in (metadata, transformer_options):
         runtime_shape = _runtime_shape_from_mapping(query_len, mapping)
         if runtime_shape is not None:
-            return runtime_shape
-    square = infer_square_spatial_shape(query_len)
-    if square is not None:
-        return _shape_info(square, "square_legacy")
+            if runtime_shape.shape is None:
+                return runtime_shape
+            found.append(runtime_shape)
+    if len({item.shape for item in found}) > 1:
+        return _shape_info(None, "runtime_metadata", "spatial_shape_ambiguous")
+    if found:
+        return found[0]
     return _shape_info(None, "none", "spatial_shape_missing")
 
 
@@ -843,14 +884,22 @@ class ScopeMatcher:
 
     def _select_encoder_equivalent(self, identity: ScopeIdentity) -> ScopeSelection:
         identity_tokens = self._identity_tokens(identity)
-        if self.stage_tokens and identity.stage_tag in self.stage_tokens:
-            return ScopeSelection(True, identity.block_id, None)
         if self.load_error is not None:
             return ScopeSelection(False, identity.block_id, "scope_map_load_failed")
-        if not self.encoder_candidate_tokens:
+        candidates = [entry for entry in self.map_entries if _scope_entry_is_encoder_candidate(entry)]
+        if not candidates:
             return ScopeSelection(False, identity.block_id, "no_encoder_equivalent_candidates")
-        if identity_tokens.intersection(self.encoder_candidate_tokens):
-            return ScopeSelection(True, identity.block_id, None)
+        # A candidate is a structured identity, never a bag of shared stage/class tokens.
+        for entry in candidates:
+            if entry.get("match_type") == "stage" and entry.get("stage_tag") == identity.stage_tag:
+                return ScopeSelection(True, identity.block_id, None)
+            constraints = []
+            for key, actual in (("block_id", identity.block_id), ("block_path", identity.block_path),
+                                ("module_path", identity.block_path), ("block_index", identity.block_index)):
+                if entry.get(key) is not None:
+                    constraints.append(str(entry[key]) == str(actual))
+            if constraints and all(constraints):
+                return ScopeSelection(True, identity.block_id, None)
         return ScopeSelection(False, identity.block_id, "encoder_equivalent_not_selected")
 
 
@@ -889,11 +938,6 @@ def _append_unique_shape_candidate(
 def _spatial_shape_candidates_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_shapes: set[tuple[int, int]] = set()
-    x = args[0] if args and torch.is_tensor(args[0]) else kwargs.get("x")
-    if torch.is_tensor(x) and x.ndim == 4:
-        _append_unique_shape_candidate(candidates, seen_shapes, "x_middle_hw", x.shape[1], x.shape[2])
-        _append_unique_shape_candidate(candidates, seen_shapes, "x_last_hw", x.shape[-2], x.shape[-1])
-
     rope_emb = kwargs.get("rope_emb")
     if isinstance(rope_emb, dict):
         for key in ("afm_spatial_shape", "spatial_shape", "latent_shape"):
@@ -937,6 +981,7 @@ class AnimaAFMBlockMetadataWrapper(nn.Module):
             return self.original(*args, **kwargs)
 
         patch_values = {
+            "_anima_afm_cross_attention": _AFM_CROSS_ATTENTION,
             "block": ("blocks", self.block_index, "cross_attn"),
             "block_id": f"blocks.{self.block_index}.cross_attn",
             "block_index": self.block_index,
@@ -1053,7 +1098,7 @@ def estimate_logits_mib(batch: int, heads: int, query_len: int, text_len: int, b
     return batch * heads * query_len * text_len * bytes_per / (1024**2)
 
 
-def estimate_peak_mib(logits_mib: float, peak_multiplier: float = 4.0) -> float:
+def estimate_peak_mib(logits_mib: float, peak_multiplier: float = 8.0) -> float:
     return float(logits_mib) * peak_multiplier
 
 
@@ -1063,11 +1108,12 @@ def estimate_attention_memory(
     query_len: int,
     text_len: int,
     bytes_per: int = 4,
-    peak_multiplier: float = 4.0,
+    peak_multiplier: float = 8.0,
 ) -> MemoryEstimate:
     logits_mib = estimate_logits_mib(selected_batch, heads, query_len, text_len, bytes_per)
     complex_bytes = bytes_per * 2
     fft_complex_mib = estimate_logits_mib(selected_batch, heads, query_len, text_len, complex_bytes)
+    peak_multiplier = max(8.0, float(peak_multiplier))
     estimated_peak_mib = estimate_peak_mib(logits_mib, peak_multiplier)
     return MemoryEstimate(
         selected_batch=int(selected_batch),
@@ -1085,17 +1131,17 @@ def estimate_attention_memory(
     )
 
 
-def memory_estimate_record(logits_mib: float | None, peak_mib: float | None, peak_multiplier: float = 4.0) -> dict[str, Any] | None:
+def memory_estimate_record(logits_mib: float | None, peak_mib: float | None, peak_multiplier: float = 8.0) -> dict[str, Any] | None:
     if logits_mib is None or peak_mib is None:
         return None
     return {
         "logits_mib": logits_mib,
         "peak_multiplier": peak_multiplier,
         "estimated_peak_mib": peak_mib,
-        "method": "conservative_full_fft_multiplier",
+        "method": "live_tensor_lifetime_estimate_workspace_excluded",
         "notes": (
             "Includes logits, edited/restored logits, softmax probabilities, and FFT spectrum "
-            "as a coarse upper estimate."
+            "as an estimate excluding backend FFT/GEMM workspace and allocator overhead."
         ),
     }
 
@@ -1210,8 +1256,9 @@ def attention_from_edited_logits(
     heads: int,
     skip_output_reshape: bool,
 ) -> torch.Tensor:
-    attn = torch.softmax(logits, dim=-1).to(value.dtype)
-    out = torch.matmul(attn, value)
+    with torch.autocast(device_type=logits.device.type, enabled=False):
+        attn = torch.softmax(logits.float(), dim=-1).to(value.dtype)
+        out = torch.matmul(attn, value)
     if skip_output_reshape:
         return out
     batch, _, query_len, head_dim = out.shape
@@ -1267,6 +1314,12 @@ def sampled_spectral_diagnostics(
         with torch.no_grad():
             conc_before = topk_concentration_map_from_logits(before_branch, config.diagnostic_top_k)
             conc_after = topk_concentration_map_from_logits(after_branch, config.diagnostic_top_k)
+            metric_defined = True
+            for concentration in (conc_before, conc_after):
+                centered = concentration - concentration.mean(dim=-1, keepdim=True)
+                # Parseval: fft2 total energy = query count * spatial energy.
+                energy = centered.square().sum(dim=-1) * concentration.shape[-1]
+                metric_defined = metric_defined and bool((torch.isfinite(energy) & (energy > 1e-8)).all())
             rho_before = hf_ratio_from_concentration(conc_before, spatial_shape, config.cutoff)
             rho_after = hf_ratio_from_concentration(conc_after, spatial_shape, config.cutoff)
             probs_before = torch.softmax(before_branch.float(), dim=-1)
@@ -1281,6 +1334,8 @@ def sampled_spectral_diagnostics(
                 attn_delta_mean=float(attn_delta.mean().detach().cpu().item()),
                 attn_delta_max=float(attn_delta.max().detach().cpu().item()),
                 edit_applied=edit_applied,
+                metric_defined=metric_defined,
+                metric_undefined_reason=None if metric_defined else "zero_or_nonfinite_centered_energy",
             ))
     return diagnostics
 
@@ -1294,15 +1349,28 @@ class AnimaAFMAttentionOverride:
         self._diagnostic_call_indices = parse_call_index_scope(config.diagnostic_call_indices)
         self._target_call_indices = parse_call_index_scope(config.target_call_indices)
         self._scope_matcher = ScopeMatcher(config)
+        self._evaluation_call_index: int | None = None
+        self.model_evaluation_index = -1
+        self.managed_lifecycle = False
+        self.telemetry_errors = 0
+        self.sampling_status = "unmanaged"
+        self.sampling_error_type = None
+
+    def begin_model_evaluation(self) -> None:
+        self._evaluation_call_index = 0
+        self.model_evaluation_index += 1
 
     def finalize(self) -> None:
-        if self.stats.active_step_index is not None:
+        if self.managed_lifecycle:
+            for step_index in sorted(self.stats.steps):
+                self._finalize_step(step_index, "outer_sampling_finished")
+        elif self.stats.active_step_index is not None:
             self._finalize_step(self.stats.active_step_index, "finalize_called")
         self._log_run_final_summary()
 
     def _step_for(self, progress: ProgressInfo) -> StepStats:
         active = self.stats.active_step_index
-        if active is not None and active != progress.index:
+        if not self.managed_lifecycle and active is not None and active != progress.index:
             self._finalize_step(active, "step_change")
         self.stats.active_step_index = progress.index
         return self.stats.step_for(progress)
@@ -1327,6 +1395,8 @@ class AnimaAFMAttentionOverride:
             self.stats.expected_total_calls_per_step = step.total_calls
 
     def _maybe_finalize_current_step(self, progress: ProgressInfo | None) -> None:
+        if self.managed_lifecycle:
+            return
         if progress is None or progress.index != progress.last_index:
             return
         expected = self.stats.expected_total_calls_per_step
@@ -1349,7 +1419,7 @@ class AnimaAFMAttentionOverride:
         estimated_logits_mib: float,
         memory_estimate: dict[str, Any] | None = None,
     ) -> float:
-        estimated_peak_mib = estimate_peak_mib(estimated_logits_mib)
+        estimated_peak_mib = float(memory_estimate["estimated_peak_mib"]) if memory_estimate is not None else estimate_peak_mib(estimated_logits_mib)
         if estimated_peak_mib >= step.max_estimated_peak_mib and memory_estimate is not None:
             step.max_memory_estimate = memory_estimate
         step.max_estimated_logits_mib = max(step.max_estimated_logits_mib, estimated_logits_mib)
@@ -1365,9 +1435,9 @@ class AnimaAFMAttentionOverride:
         for diagnostic in diagnostics:
             step.spectral_diagnostics[diagnostic.branch] = diagnostic
             step.spectral_diagnostic_records.append((eligible_call_index, diagnostic))
-            step.rho_before = diagnostic.rho_before
-            step.rho_after = diagnostic.rho_after
-            step.delta_rho = diagnostic.delta_rho
+            step.rho_before = diagnostic.rho_before if diagnostic.metric_defined else None
+            step.rho_after = diagnostic.rho_after if diagnostic.metric_defined else None
+            step.delta_rho = diagnostic.delta_rho if diagnostic.metric_defined else None
             step.max_attn_delta = max(step.max_attn_delta or 0.0, diagnostic.attn_delta_max)
 
     def _unselected_indices(self, batch: int, selected: torch.Tensor) -> torch.Tensor:
@@ -1395,6 +1465,10 @@ class AnimaAFMAttentionOverride:
             "schema_version": 2,
             "record_type": record_type,
             "run_id": self.run_id,
+            "model_evaluation_index": self.model_evaluation_index,
+            "sampling_status": self.sampling_status,
+            "sampling_error_type": self.sampling_error_type,
+            "telemetry_errors": self.telemetry_errors,
         }
         if progress is not None:
             record.update({
@@ -1492,10 +1566,13 @@ class AnimaAFMAttentionOverride:
         self._emit_jsonl(record)
 
     def _spectral_summary(self, step: StepStats) -> dict[str, Any]:
-        records = step.spectral_diagnostic_records
+        records = [(index, diagnostic) for index, diagnostic in step.spectral_diagnostic_records if diagnostic.metric_defined]
+        undefined_count = len(step.spectral_diagnostic_records) - len(records)
         if not records:
             return {
                 "spectral_diag_count": 0,
+                "spectral_undefined_count": undefined_count,
+                "spectral_emitted_count": len(step.spectral_diagnostic_records),
                 "spectral_delta_rho_mean": None,
                 "spectral_delta_rho_min": None,
                 "spectral_delta_rho_max": None,
@@ -1509,6 +1586,8 @@ class AnimaAFMAttentionOverride:
 
         return {
             "spectral_diag_count": len(records),
+            "spectral_undefined_count": undefined_count,
+            "spectral_emitted_count": len(step.spectral_diagnostic_records),
             "spectral_delta_rho_mean": sum(deltas) / len(deltas),
             "spectral_delta_rho_min": min(deltas),
             "spectral_delta_rho_max": max(deltas),
@@ -1551,9 +1630,9 @@ class AnimaAFMAttentionOverride:
     def _log_run_final_summary(self) -> None:
         if self.stats.run_final_summary_emitted or self.config.debug_level == "off":
             return
-        if not self.stats.steps:
+        if not self.stats.steps and not self.managed_lifecycle:
             return
-        last_step_index = max(self.stats.steps)
+        last_step_index = max(self.stats.steps) if self.stats.steps else None
         record = self._record_base("run_final_summary", None)
         record.update({
             "last_step_index": last_step_index,
@@ -1584,17 +1663,34 @@ class AnimaAFMAttentionOverride:
 
     def __call__(self, original_func: Callable, *args: Any, **kwargs: Any) -> torch.Tensor:
         progress = self._progress_from_kwargs(kwargs)
+        original_called = False
+        original_result = None
+        original_error = None
+        def original_once(*call_args, **call_kwargs):
+            nonlocal original_called, original_result, original_error
+            if not original_called:
+                original_called = True
+                try:
+                    original_result = original_func(*call_args, **call_kwargs)
+                    if not self._handle_off_or_zero_original() and (not torch.is_tensor(original_result) or not bool(torch.isfinite(original_result).all())):
+                        raise RuntimeError("Anima AFM stopped: nonfinite original attention output")
+                except BaseException as exc:
+                    original_error = exc
+                    raise
+            if original_error is not None:
+                raise original_error
+            return original_result
         try:
-            result = self._call(original_func, *args, **kwargs)
+            result = self._call(original_once, *args, **kwargs)
         except Exception as exc:
-            if self.config.fail_mode == "raise":
+            if original_error is not None or self.config.fail_mode == "raise":
                 LOGGER.exception("%s attention override failed", LOG_PREFIX)
                 raise
             if progress is not None:
                 self._step_for(progress)
-            self.stats.record_fallback("oom_or_runtime_error", progress)
+            self.stats.record_fallback(exc.reason if isinstance(exc, AFMFallback) else "oom_or_runtime_error", progress)
             LOGGER.warning("%s falling back after %s: %s", LOG_PREFIX, type(exc).__name__, exc)
-            result = original_func(*args, **kwargs)
+            result = original_once(*args, **kwargs)
         self._maybe_finalize_current_step(progress)
         return result
 
@@ -1631,11 +1727,23 @@ class AnimaAFMAttentionOverride:
         q, k, v, heads = args[:4]
         if not all(torch.is_tensor(t) and t.ndim == 4 for t in (q, k, v)):
             raise AFMFallback("bad_rank")
+        if any(t.dtype not in (torch.float16, torch.bfloat16, torch.float32) for t in (q, k, v)) or len({t.dtype for t in (q,k,v)}) != 1:
+            raise AFMFallback("unsupported_attention_dtype")
+        if len({t.device for t in (q,k,v)}) != 1 or any(min(t.shape) <= 0 for t in (q,k,v)):
+            raise AFMFallback("invalid_attention_shape")
+        if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0] or k.shape[-2] != v.shape[-2] or q.shape[-1] != k.shape[-1] or int(heads) != q.shape[1]:
+            raise AFMFallback("invalid_attention_shape")
+        if not all(bool(torch.isfinite(t).all()) for t in (q,k,v)):
+            raise AFMFallback("nonfinite_attention_input")
         return q, k, v, int(heads)
 
     def _prepare_context(self, original_func: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]) -> AttentionCallContext:
         q, k, v, heads = self._extract_raw_attention_args(args)
         transformer_options = kwargs.get("transformer_options") or {}
+        scale = kwargs.get("scale")
+        scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+        if not math.isfinite(scale):
+            raise AFMFallback("nonfinite_attention_scale")
         progress = progress_from_sigmas(transformer_options)
         if progress is not None:
             self._step_for(progress).total_calls += 1
@@ -1648,7 +1756,7 @@ class AnimaAFMAttentionOverride:
 
         query_len = int(q.shape[-2])
         text_len = int(k.shape[-2])
-        if query_len == text_len:
+        if query_len == text_len and transformer_options.get("_anima_afm_cross_attention") is not _AFM_CROSS_ATTENTION:
             raise AFMFallback("not_cross_attention")
         if progress is None:
             raise AFMFallback("missing_sigmas")
@@ -1667,7 +1775,7 @@ class AnimaAFMAttentionOverride:
             active_mode = "observe"
 
         step = self._step_for(progress)
-        eligible_call_index = step.eligible_calls
+        eligible_call_index = step.eligible_calls if self._evaluation_call_index is None else self._evaluation_call_index
         block_id, metadata = discover_transformer_metadata(transformer_options)
         spatial_info = infer_spatial_shape(query_len, self.config, transformer_options, metadata)
         if spatial_info.shape is None:
@@ -1675,6 +1783,8 @@ class AnimaAFMAttentionOverride:
         spatial_shape = spatial_info.shape
         scope_identity = scope_identity_from_metadata(block_id, metadata)
         scope_selection = self._scope_matcher.select(scope_identity)
+        if self._evaluation_call_index is not None:
+            self._evaluation_call_index += 1
         step.eligible_calls += 1
         step.eligible_call_indices[eligible_call_index] += 1
         step.shape_counts[shape_key(q, k)] += 1
@@ -1699,7 +1809,7 @@ class AnimaAFMAttentionOverride:
             k=k,
             v=v,
             heads=heads,
-            scale=float(kwargs.get("scale", q.shape[-1] ** -0.5)),
+            scale=scale,
             transformer_options=transformer_options,
             progress=progress,
             step=step,
@@ -1728,25 +1838,42 @@ class AnimaAFMAttentionOverride:
     def _compute_passthrough_diagnostics(self, context: AttentionCallContext, selected: torch.Tensor) -> list[SpectralDiagnostic]:
         if not self._should_run_spectral_diag(context.progress, context.eligible_call_index):
             return []
-        all_selected = int(selected.numel()) == context.batch
-        q_diag = context.q if all_selected else context.q.index_select(0, selected)
-        k_diag = context.k if all_selected else context.k.index_select(0, selected)
-        v_diag = context.v if all_selected else context.v.index_select(0, selected)
-        try:
-            q_diag, k_diag, v_diag, _ = maybe_repeat_gqa(q_diag, k_diag, v_diag, context.kwargs)
-            logits = torch.matmul(q_diag.float(), k_diag.float().transpose(-2, -1)) * context.scale
-        except AFMFallback:
-            return []
-        return sampled_spectral_diagnostics(
-            logits,
-            logits,
-            context.spatial_shape,
-            self.config,
-            selected,
-            context.batch,
-            context.cond_or_uncond,
-            edit_applied=False,
-        )
+        diagnostics = []
+        q_heads, k_heads, v_heads = (int(t.shape[1]) for t in (context.q, context.k, context.v))
+        if k_heads != v_heads or q_heads % k_heads or (q_heads != k_heads and not context.kwargs.get("enable_gqa", False)):
+            raise AFMFallback("gqa_head_mismatch")
+        # Select each branch's batches and query heads before any QK allocation.
+        for branch, positions, batch_indices in diagnostic_batch_positions(selected, context.batch, context.cond_or_uncond, self.config.diagnostic_branch):
+            if self.config.spectral_diag == "sampled":
+                batch_indices = batch_indices[:self.config.diagnostic_max_batches]
+            if not batch_indices:
+                continue
+            heads = min(q_heads, self.config.diagnostic_max_heads) if self.config.spectral_diag == "sampled" else q_heads
+            self._guard_allocation(context, len(batch_indices), heads, diagnostics=True)
+            index = torch.tensor(batch_indices, device=context.q.device, dtype=torch.long)
+            head_index = torch.arange(heads, device=context.q.device) // (q_heads // k_heads)
+            q_diag = context.q[:, :heads].index_select(0, index)
+            k_diag = context.k[index[:, None], head_index[None, :]]
+            with torch.autocast(device_type=q_diag.device.type, enabled=False):
+                logits = torch.matmul(q_diag.float(), k_diag.float().transpose(-2, -1)) * context.scale
+            if not bool(torch.isfinite(logits).all()):
+                raise AFMFallback("nonfinite_attention_logits")
+            diagnostics.extend(sampled_spectral_diagnostics(logits, logits, context.spatial_shape, self.config,
+                               index, context.batch, context.cond_or_uncond, edit_applied=False))
+        return diagnostics
+
+    def _guard_allocation(self, context: AttentionCallContext, batch: int, heads: int, diagnostics: bool = False) -> dict[str, Any]:
+        estimate = estimate_attention_memory(batch, heads, context.query_len, context.text_len,
+                    peak_multiplier=12.0 if diagnostics or self.config.spectral_diag != "off" else 8.0).to_record()
+        # Branch copies, fp32 Q/K/V casts, GQA repeats and the output may coexist.
+        qkv_elements = batch * heads * (context.query_len * context.q.shape[-1] +
+                        context.text_len * (context.k.shape[-1] + context.v.shape[-1]))
+        workspace = 3 * qkv_elements * 4 / (1024 ** 2)
+        estimate["qkv_workspace_mib"] = workspace
+        estimate["estimated_peak_mib"] += workspace
+        self._update_peak_estimate(context.step, estimate["logits_mib"], estimate)
+        self._enforce_memory_guards(context, context.q, context.k, estimate["logits_mib"], estimate["estimated_peak_mib"])
+        return estimate
 
     def _handle_observe_call(self, context: AttentionCallContext) -> torch.Tensor:
         self.stats.observed_calls += 1
@@ -1814,14 +1941,14 @@ class AnimaAFMAttentionOverride:
         )
 
     def _compute_logits_bundle(self, context: AttentionCallContext) -> LogitsBundle:
+        memory_estimate = self._guard_allocation(context, int(context.selected.numel()), int(context.q.shape[1]))
         q_sel, k_sel, v_sel, _ = self._select_branch_tensors(context)
         q_sel, k_sel, v_sel, gqa_info = maybe_repeat_gqa(q_sel, k_sel, v_sel, context.kwargs)
-        memory_estimate = estimate_attention_memory(int(q_sel.shape[0]), int(q_sel.shape[1]), int(q_sel.shape[-2]), int(k_sel.shape[-2])).to_record()
-        estimated = memory_estimate["logits_mib"]
-        estimated_peak = self._update_peak_estimate(context.step, estimated, memory_estimate)
-        self._enforce_memory_guards(context, q_sel, k_sel, estimated, estimated_peak)
-        logits = torch.matmul(q_sel.float(), k_sel.float().transpose(-2, -1)) * context.scale
-        return LogitsBundle(q_sel, k_sel, v_sel, logits, gqa_info, estimated, estimated_peak, memory_estimate)
+        with torch.autocast(device_type=q_sel.device.type, enabled=False):
+            logits = torch.matmul(q_sel.float(), k_sel.float().transpose(-2, -1)) * context.scale
+        if not bool(torch.isfinite(logits).all()):
+            raise AFMFallback("nonfinite_attention_logits")
+        return LogitsBundle(q_sel, k_sel, v_sel, logits, gqa_info, memory_estimate["logits_mib"], memory_estimate["estimated_peak_mib"], memory_estimate)
 
     def _enforce_memory_guards(
         self,
@@ -1891,32 +2018,42 @@ class AnimaAFMAttentionOverride:
         entropy_value = normalized_token_entropy(bundle.logits) if self.config.entropy_gate else None
         alpha_lf, alpha_hf = schedule_alphas(self.config, context.progress.progress, entropy_value)
         edited_logits = edit_logits_fft(bundle.logits, context.spatial_shape, alpha_lf, alpha_hf, self.config)
+        if not bool(torch.isfinite(edited_logits).all()):
+            raise AFMFallback("nonfinite_edited_logits")
         out_sel = attention_from_edited_logits(
             edited_logits,
             bundle.v,
             int(bundle.q.shape[1]),
             bool(context.kwargs.get("skip_output_reshape", False)),
         )
+        if not bool(torch.isfinite(out_sel).all()):
+            raise AFMFallback("nonfinite_attention_output")
         out = self._compose_partial_branch_output(context, out_sel)
 
-        self.stats.edited_calls += 1
-        context.step.edited_calls += 1
         logits_delta = float((edited_logits - bundle.logits).abs().max().detach().cpu().item())
         context.step.max_logit_delta = max(context.step.max_logit_delta, logits_delta)
         diagnostics = self._compute_edit_diagnostics(context, bundle.logits, edited_logits)
+        self.stats.edited_calls += 1
+        context.step.edited_calls += 1
         self._record_spectral_diagnostics(context.step, context.eligible_call_index, diagnostics)
-        self._log_eligible_from_context(
-            context,
-            "edit",
-            alpha_lf,
-            alpha_hf,
-            entropy_value,
-            bundle.gqa_info,
-            bundle.estimated_logits_mib,
-            bundle.estimated_peak_mib,
-            logits_delta,
-            diagnostics,
-        )
+        try:
+            self._log_eligible_from_context(
+                context,
+                "edit",
+                alpha_lf,
+                alpha_hf,
+                entropy_value,
+                bundle.gqa_info,
+                bundle.estimated_logits_mib,
+                bundle.estimated_peak_mib,
+                logits_delta,
+                diagnostics,
+            )
+        except Exception:
+            # Telemetry failure must not turn an already computed edit into a
+            # different inference result. Missing evidence invalidates validation.
+            self.telemetry_errors += 1
+            LOGGER.exception("%s edit returned but telemetry failed; this run is not valid evidence", LOG_PREFIX)
         return out
 
     def _log_eligible_from_context(
@@ -1971,12 +2108,11 @@ class AnimaAFMAttentionOverride:
     ) -> dict[str, Any] | None:
         if estimated_logits_mib is None or estimated_peak_mib is None:
             return None
-        return estimate_attention_memory(
-            int(selected.numel()),
-            int(q.shape[1]),
-            int(q.shape[-2]),
-            int(k.shape[-2]),
-        ).to_record()
+        record = estimate_attention_memory(int(selected.numel()), int(q.shape[1]), int(q.shape[-2]), int(k.shape[-2])).to_record()
+        record["estimated_peak_mib"] = estimated_peak_mib
+        record["logits_mib"] = estimated_logits_mib
+        record["peak_multiplier"] = estimated_peak_mib / estimated_logits_mib if estimated_logits_mib else None
+        return record
 
     def _progress_from_kwargs(self, kwargs: dict[str, Any]) -> ProgressInfo | None:
         transformer_options = kwargs.get("transformer_options") or {}
@@ -2432,6 +2568,15 @@ class AnimaAFMAttentionOverride:
             "batch_indices": diagnostic.batch_indices,
             "alpha_lf": alpha_lf,
             "alpha_hf": alpha_hf,
+            "metric_defined": diagnostic.metric_defined,
+            "metric_undefined_reason": diagnostic.metric_undefined_reason,
+            "rho_definition": "centered_concentration_hf_energy_ratio",
+            "rho_centering": "spatial_mean_subtracted",
+            "cutoff": self.config.cutoff,
+            "diagnostic_top_k": self.config.diagnostic_top_k,
+            "spectral_diag": self.config.spectral_diag,
+            "diagnostic_max_batches": self.config.diagnostic_max_batches,
+            "diagnostic_max_heads": self.config.diagnostic_max_heads,
             "rho_before": diagnostic.rho_before,
             "rho_after": diagnostic.rho_after,
             "delta_rho": diagnostic.delta_rho,

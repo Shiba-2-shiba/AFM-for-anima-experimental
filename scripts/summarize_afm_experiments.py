@@ -4,18 +4,18 @@ import argparse
 import csv
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 try:
     from .compare_afm_runs import FIELDNAMES as COMPARE_FIELDNAMES
     from .compare_afm_runs import PAIR_KEY_COLUMNS
-    from .compare_afm_runs import _boolish, _intish, _mean, _numeric
+    from .compare_afm_runs import _boolish, _intish, _mean, _numeric, _key, _boolean, _json_object, _completion_issues, summarize_rows
 except ImportError:  # pragma: no cover - direct script execution
     from compare_afm_runs import FIELDNAMES as COMPARE_FIELDNAMES
     from compare_afm_runs import PAIR_KEY_COLUMNS
-    from compare_afm_runs import _boolish, _intish, _mean, _numeric
+    from compare_afm_runs import _boolish, _intish, _mean, _numeric, _key, _boolean, _json_object, _completion_issues, summarize_rows
 
 
 OVERVIEW_FIELDNAMES = [
@@ -23,6 +23,7 @@ OVERVIEW_FIELDNAMES = [
     "rows",
     "matched",
     "missing_observe",
+    "unmatched_observe_pairs",
     "duplicate_observe_pairs",
     "duplicate_edit_pairs",
     "overall_delta_rho_local_mean",
@@ -34,6 +35,10 @@ OVERVIEW_FIELDNAMES = [
     "late_rows",
     "late_edited_delta_rho_vs_observe_mean",
     "max_abs_delta_rho_vs_observe",
+    "validation_passed",
+    "provenance_status",
+    "rho_definition",
+    "rho_centering",
 ]
 
 BY_CALL_BRANCH_FIELDNAMES = [
@@ -97,6 +102,9 @@ PRESERVATION_FIELDNAMES = [
     "delta_rho_local_mean",
     "attn_delta_mean_mean",
     "attn_delta_max_max",
+    "delta_rho_local_max_abs",
+    "complete_tensor_rows",
+    "same_call_preservation_passed",
 ]
 
 
@@ -108,7 +116,9 @@ def _read_compare_rows(path: str | Path) -> list[dict[str, Any]]:
             data = data["rows"]
         if not isinstance(data, list):
             raise ValueError(f"Expected compare JSON rows in {path}")
-        return [_normalize_row(row) for row in data if isinstance(row, dict)]
+        if any(not isinstance(row, dict) for row in data):
+            raise ValueError(f"Every compare JSON row must be an object in {path}")
+        return [_normalize_row(row) for row in data]
     with path.open("r", encoding="utf-8", newline="") as handle:
         return [_normalize_row(row) for row in csv.DictReader(handle)]
 
@@ -135,7 +145,9 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = parsed
     for key in ("edit_applied", "observe_duplicate", "edit_duplicate"):
         if normalized.get(key) not in (None, ""):
-            normalized[key] = _boolish(normalized.get(key))
+            parsed = _boolean(normalized.get(key))
+            if parsed is not None:
+                normalized[key] = parsed
     if "diagnostic_branch" not in normalized:
         normalized["diagnostic_branch"] = normalized.get("branch")
     return normalized
@@ -171,8 +183,13 @@ def _is_edited(row: dict[str, Any]) -> bool:
     return _boolish(row.get("edit_applied"))
 
 
-def _pair_key(row: dict[str, Any]) -> tuple[Any, Any, Any]:
-    return row.get("step_index"), row.get("eligible_call_index"), row.get("branch")
+def _edit_label(row: dict[str, Any]) -> str:
+    value = _boolean(row.get("edit_applied"))
+    return str(value) if value is not None else "Unknown"
+
+
+def _pair_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return _key(row)
 
 
 def _duplicate_pairs(rows: list[dict[str, Any]], duplicate_field: str, count_field: str) -> int:
@@ -185,6 +202,7 @@ def _duplicate_pairs(rows: list[dict[str, Any]], duplicate_field: str, count_fie
 
 
 def _overview_row(comparison: str, rows: list[dict[str, Any]], late_start_step: int | None) -> dict[str, Any]:
+    evidence = summarize_rows(rows)
     edited = [row for row in rows if _is_edited(row)]
     late_rows = [
         row for row in rows
@@ -196,6 +214,7 @@ def _overview_row(comparison: str, rows: list[dict[str, Any]], late_start_step: 
         "rows": len(rows),
         "matched": sum(1 for row in rows if _is_matched(row)),
         "missing_observe": sum(1 for row in rows if _is_missing(row)),
+        "unmatched_observe_pairs": evidence["unmatched_observe_pairs"],
         "duplicate_observe_pairs": _duplicate_pairs(rows, "observe_duplicate", "observe_pair_count"),
         "duplicate_edit_pairs": _duplicate_pairs(rows, "edit_duplicate", "edit_pair_count"),
         "overall_delta_rho_local_mean": _mean_field(rows, "delta_rho_local"),
@@ -207,6 +226,11 @@ def _overview_row(comparison: str, rows: list[dict[str, Any]], late_start_step: 
         "late_rows": len(late_rows),
         "late_edited_delta_rho_vs_observe_mean": _mean_field(late_edited, "delta_rho_vs_observe"),
         "max_abs_delta_rho_vs_observe": _max_abs_field(rows, "delta_rho_vs_observe"),
+        "validation_passed": _valid_comparison(rows, evidence),
+        "provenance_status": evidence["provenance_status"],
+        "rho_definition": _mode_label(rows, "rho_definition") or "legacy_unspecified",
+        "rho_centering": _mode_label(rows, "rho_centering") or "unknown",
+
     }
 
 
@@ -224,7 +248,7 @@ def _by_call_branch_rows(comparison: str, rows: list[dict[str, Any]], late_start
     for row in rows:
         grouped[(row.get("eligible_call_index"), row.get("branch"))].append(row)
     output = []
-    for (eligible_call_index, branch), items in sorted(grouped.items(), key=lambda item: (item[0][0], str(item[0][1]))):
+    for (eligible_call_index, branch), items in sorted(grouped.items(), key=lambda item: repr(item[0])):
         edited = [row for row in items if _is_edited(row)]
         late = [
             row for row in items
@@ -253,7 +277,7 @@ def _by_call_rows(comparison: str, rows: list[dict[str, Any]], late_start_step: 
     for row in rows:
         grouped[row.get("eligible_call_index")].append(row)
     output = []
-    for eligible_call_index, items in sorted(grouped.items(), key=lambda item: item[0]):
+    for eligible_call_index, items in sorted(grouped.items(), key=lambda item: repr(item[0])):
         edited = [row for row in items if _is_edited(row)]
         late = [
             row for row in items
@@ -278,7 +302,7 @@ def _by_step_rows(comparison: str, rows: list[dict[str, Any]]) -> list[dict[str,
     for row in rows:
         grouped[row.get("step_index")].append(row)
     output = []
-    for step_index, items in sorted(grouped.items(), key=lambda item: item[0]):
+    for step_index, items in sorted(grouped.items(), key=lambda item: repr(item[0])):
         edited = [row for row in items if _is_edited(row)]
         output.append({
             "comparison": comparison,
@@ -300,11 +324,11 @@ def _by_diagnostic_mode_rows(comparison: str, rows: list[dict[str, Any]]) -> lis
         grouped[(
             row.get("call_mode"),
             row.get("diagnostic_mode"),
-            str(_boolish(row.get("edit_applied"))),
+            _edit_label(row),
             row.get("branch"),
         )].append(row)
     output = []
-    for (call_mode, diagnostic_mode, edit_applied, branch), items in sorted(grouped.items()):
+    for (call_mode, diagnostic_mode, edit_applied, branch), items in sorted(grouped.items(), key=lambda item: repr(item[0])):
         output.append({
             "comparison": comparison,
             "call_mode": call_mode,
@@ -331,10 +355,10 @@ def _branch_preservation_rows(
             row.get("diagnostic_branch") or row.get("branch"),
             row.get("call_mode"),
             row.get("diagnostic_mode"),
-            str(_boolish(row.get("edit_applied"))),
+            _edit_label(row),
         )].append(row)
     output = []
-    for (branch, call_mode, diagnostic_mode, edit_applied), items in sorted(grouped.items()):
+    for (branch, call_mode, diagnostic_mode, edit_applied), items in sorted(grouped.items(), key=lambda item: repr(item[0])):
         output.append({
             "comparison": comparison,
             "diagnostic_branch": branch,
@@ -345,8 +369,61 @@ def _branch_preservation_rows(
             "delta_rho_local_mean": _mean_field(items, "delta_rho_local"),
             "attn_delta_mean_mean": _mean_field(items, "attn_delta_mean"),
             "attn_delta_max_max": _max_field(items, "attn_delta_max"),
+            "delta_rho_local_max_abs": _max_abs_field(items, "delta_rho_local"),
+            "complete_tensor_rows": sum(_has_tensor_evidence(row) for row in items),
+            "same_call_preservation_passed": all(_preserved(row) for row in items) if edit_applied == "False" else None,
         })
     return output
+
+
+def _valid_comparison(rows: list[dict[str, Any]], evidence: dict[str, Any]) -> bool:
+    if not rows or not evidence["validation_passed"] or evidence["provenance_status"] != "manifest_verified":
+        return False
+    for side in ("observe", "edit"):
+        reconstructed = [dict(row, run_id=row.get(f"{side}_run_id"), run_completion_json=row.get(f"{side}_completion_json")) for row in rows]
+        if _completion_issues(reconstructed, side):
+            return False
+    if any(count != 1 for count in Counter(_pair_key(row) for row in rows).values()):
+        return False
+    for row in rows:
+        if row.get("pair_status") != "matched" or _intish(row.get("unmatched_observe_pairs")) != 0:
+            return False
+        if _intish(row.get("observe_pair_count")) != 1 or _intish(row.get("edit_pair_count")) != 1:
+            return False
+        if any(_numeric(row.get(field)) is None for field in ("rho_observe", "rho_edit_before", "rho_edit_after", "delta_rho_local", "delta_rho_vs_observe")):
+            return False
+    return True
+
+
+def _has_tensor_evidence(row: dict[str, Any]) -> bool:
+    mean = _numeric(row.get("attn_delta_mean"))
+    maximum = _numeric(row.get("attn_delta_max"))
+    return mean is not None and maximum is not None and 0 <= mean <= maximum
+
+
+def _preserved(row: dict[str, Any]) -> bool:
+    local_delta = _numeric(row.get("delta_rho_local"))
+    return (_boolean(row.get("edit_applied")) is False and _has_tensor_evidence(row)
+            and local_delta is not None and abs(local_delta) <= 1e-12
+            and _numeric(row.get("attn_delta_max")) <= 1e-12)
+
+
+def _preservation_check(name: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    # Cross-run rho is intentionally excluded: trajectory drift cannot prove or
+    # disprove preservation of an unselected branch in the same attention call.
+    eligible = [row for row in rows if _boolean(row.get("edit_applied")) is False
+                and row.get("call_mode") == "edit" and row.get("diagnostic_mode") == "passthrough"]
+    errors = []
+    if not rows:
+        errors.append("No rows for requested preservation run")
+    if any(_boolean(row.get("edit_applied")) is None for row in rows):
+        errors.append("Missing or invalid edit_applied")
+    if not eligible:
+        errors.append("No unedited same-call branch diagnostics")
+    if any(not _preserved(row) for row in eligible):
+        errors.append("Missing, invalid, or nonzero same-call tensor/local-rho evidence")
+    return {"comparison": name, "checked_rows": len(eligible), "passed": not errors, "errors": errors,
+            "evidence_scope": "sampled same-call attention diagnostics; not cross-run rho or final output identity"}
 
 
 def summarize_comparisons(
@@ -361,8 +438,13 @@ def summarize_comparisons(
     by_diagnostic_mode = []
     by_call = []
     branch_preservation = []
+    preservation_checks = []
+    rows_by_name = {}
     for name, path in comparisons:
+        if name in rows_by_name:
+            raise ValueError(f"Duplicate comparison name: {name}")
         rows = _read_compare_rows(path)
+        rows_by_name[name] = rows
         overview_row = _overview_row(name, rows, late_start_step)
         overview.append(overview_row)
         by_call_branch.extend(_by_call_branch_rows(name, rows, late_start_step))
@@ -370,8 +452,23 @@ def summarize_comparisons(
         by_diagnostic_mode.extend(_by_diagnostic_mode_rows(name, rows))
         by_call.extend(_by_call_rows(name, rows, late_start_step))
         branch_preservation.extend(_branch_preservation_rows(name, rows, name in preservation_runs))
+    preservation_checks = [_preservation_check(name, rows_by_name.get(name, [])) for name in preservation_runs]
     return {
         "pair_key_columns": PAIR_KEY_COLUMNS,
+        "preservation_checks": preservation_checks,
+        "provenance_by_comparison": {
+            name: {
+                "status": _mode_label(rows, "provenance_status") or "unverified",
+                "observe_run_id": _mode_label(rows, "observe_run_id"),
+                "edit_run_id": _mode_label(rows, "edit_run_id"),
+                "observe_manifest": _json_object(_mode_label(rows, "observe_manifest_json")),
+                "edit_manifest": _json_object(_mode_label(rows, "edit_manifest_json")),
+                "observe_completion": _json_object(_mode_label(rows, "observe_completion_json")),
+                "edit_completion": _json_object(_mode_label(rows, "edit_completion_json")),
+                "verification_scope": "supplied-manifest consistency; content hashes are not independently recomputed",
+            } for name, rows in rows_by_name.items()
+        },
+        "validation_passed": bool(overview) and all(row["validation_passed"] for row in overview),
         "overview": overview,
         "overview_by_name": {row["comparison"]: row for row in overview},
         "by_call_branch": by_call_branch,
@@ -392,6 +489,8 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) ->
 def _report_markdown(result: dict[str, Any]) -> str:
     lines = [
         "# AFM Experiment Summary",
+        "",
+        "Validation: " + ("passed" if result["validation_passed"] else "UNVERIFIED / FAILED; exploratory values only"),
         "",
         "| comparison | rows | matched | missing_observe | edited_rows | edited_delta_rho_vs_observe_mean | late_edited_delta_rho_vs_observe_mean |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -450,12 +549,8 @@ def _parse_compare_arg(value: str) -> tuple[str, str]:
 
 
 def _has_preservation_violation(result: dict[str, Any]) -> bool:
-    for row in result["branch_preservation_counts"]:
-        if row["diagnostic_mode"] == "passthrough" and row["edit_applied"] == "False":
-            value = _numeric(row.get("delta_rho_local_mean"))
-            if value is not None and abs(value) > 1e-12:
-                return True
-    return False
+    checks = result.get("preservation_checks", [])
+    return not checks or any(not check["passed"] for check in checks)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -469,13 +564,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-branch-preservation", action="store_true")
     parser.add_argument("--preservation-run", action="append", default=[], help="Comparison name to include in preservation counts.")
     parser.add_argument("--report-md", action="store_true", help="Write summary_report.md.")
+    parser.add_argument("--strict-validation", action="store_true", help="Require nonempty fully validated, manifest-backed comparisons.")
     args = parser.parse_args(argv)
 
-    result = summarize_comparisons(
-        args.compare,
-        late_start_step=args.late_start_step,
-        preservation_runs=args.preservation_run,
-    )
+    try:
+        result = summarize_comparisons(
+            args.compare, late_start_step=args.late_start_step, preservation_runs=args.preservation_run,
+        )
+    except (ValueError, OSError) as exc:
+        print(f"Invalid summary input: {exc}", file=sys.stderr)
+        return 2
     write_outputs(result, args.out_dir, output_format=args.format, report_md=args.report_md)
     if args.fail_on_missing_observe and any(row["missing_observe"] > 0 for row in result["overview"]):
         return 3
@@ -486,6 +584,8 @@ def main(argv: list[str] | None = None) -> int:
         return 4
     if args.require_branch_preservation and _has_preservation_violation(result):
         return 6
+    if args.strict_validation and not result["validation_passed"]:
+        return 7
     return 0
 
 

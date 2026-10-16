@@ -9,7 +9,6 @@ from comfy_api.latest import ComfyExtension, io
 from .anima_afm import (
     AFMConfig,
     AFM_MODES,
-    AnimaAFMAttentionOverride,
     BRANCH_MODES,
     DEBUG_FORMATS,
     DEBUG_LEVELS,
@@ -23,6 +22,8 @@ from .anima_afm import (
     install_anima_block_metadata_wrappers,
     is_anima_like_model,
 )
+
+from .sampling_lifecycle import install_sampling_lifecycle
 
 
 LOGGER = logging.getLogger(__name__)
@@ -177,7 +178,7 @@ class AnimaAFMModelPatch(io.ComfyNode):
         if "optimized_attention_override" in transformer_options:
             raise ValueError("Anima AFM cannot be combined with an existing optimized_attention_override patch yet.")
 
-        transformer_options["optimized_attention_override"] = AnimaAFMAttentionOverride(config)
+        install_sampling_lifecycle(patched, config)
         metadata_wrappers = install_anima_block_metadata_wrappers(patched)
         LOGGER.info(
             "[AnimaAFM] installed model patch mode=%s strength=%s cutoff=%s schedule=%s branch_mode=%s zero_strength_mode=%s metadata_wrappers=%s",

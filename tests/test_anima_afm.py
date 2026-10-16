@@ -116,6 +116,7 @@ class AnimaAFMTests(unittest.TestCase):
         return {
             "skip_reshape": True,
             "transformer_options": {
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([sigma]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
                 "cond_or_uncond": [1, 0],
@@ -202,7 +203,8 @@ class AnimaAFMTests(unittest.TestCase):
 
     def test_progress_last_model_step_reaches_one(self):
         info = progress_from_sigmas({
-            "sigmas": torch.tensor([0.5]),
+            "afm_spatial_shape": [4, 4],
+                "sigmas": torch.tensor([0.5]),
             "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
         })
         self.assertIsNotNone(info)
@@ -244,7 +246,7 @@ class AnimaAFMTests(unittest.TestCase):
             before,
             after,
             (3, 4),
-            AFMConfig(spectral_diag="sampled", diagnostic_branch="selected_mean"),
+            AFMConfig(spectral_diag="sampled", diagnostic_top_k=2, diagnostic_branch="selected_mean"),
             torch.tensor([0]),
             1,
             None,
@@ -299,6 +301,7 @@ class AnimaAFMTests(unittest.TestCase):
         kwargs = {
             "skip_reshape": True,
             "transformer_options": {
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
                 "cond_or_uncond": [1, 0],
@@ -317,6 +320,7 @@ class AnimaAFMTests(unittest.TestCase):
         kwargs = {
             "skip_reshape": True,
             "transformer_options": {
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
             },
@@ -340,6 +344,7 @@ class AnimaAFMTests(unittest.TestCase):
             2,
             skip_reshape=True,
             transformer_options={
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
                 "cond_or_uncond": [1, 0],
@@ -357,6 +362,7 @@ class AnimaAFMTests(unittest.TestCase):
         kwargs = {
             "skip_reshape": True,
             "transformer_options": {
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
                 "cond_or_uncond": [1, 0],
@@ -413,6 +419,7 @@ class AnimaAFMTests(unittest.TestCase):
         kwargs = {
             "skip_reshape": True,
             "transformer_options": {
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
                 "cond_or_uncond": [1, 0],
@@ -433,6 +440,7 @@ class AnimaAFMTests(unittest.TestCase):
         kwargs = {
             "skip_reshape": True,
             "transformer_options": {
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
                 "cond_or_uncond": [1, 0],
@@ -457,6 +465,7 @@ class AnimaAFMTests(unittest.TestCase):
             2,
             skip_reshape=True,
             transformer_options={
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
             },
@@ -480,6 +489,7 @@ class AnimaAFMTests(unittest.TestCase):
             skip_output_reshape=True,
             enable_gqa=True,
             transformer_options={
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
             },
@@ -501,6 +511,7 @@ class AnimaAFMTests(unittest.TestCase):
             2,
             skip_reshape=True,
             transformer_options={
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
             },
@@ -519,9 +530,9 @@ class AnimaAFMTests(unittest.TestCase):
         snapshot = [record for record in records if record["record_type"] == "step_snapshot"][0]
         self.assertEqual(snapshot["schema_version"], 2)
         self.assertIsInstance(snapshot["estimated_peak_mib"], float)
-        self.assertAlmostEqual(snapshot["estimated_peak_mib"], estimate_peak_mib(snapshot["estimated_logits_mib"]))
+        self.assertGreater(snapshot["estimated_peak_mib"], estimate_peak_mib(snapshot["estimated_logits_mib"]))
         self.assertEqual(snapshot["max_peak_mib"], snapshot["estimated_peak_mib"])
-        self.assertEqual(snapshot["memory_estimate"]["method"], "conservative_full_fft_multiplier")
+        self.assertEqual(snapshot["memory_estimate"]["method"], "live_tensor_lifetime_estimate_workspace_excluded")
         self.assertAlmostEqual(snapshot["memory_estimate"]["logits_mib"], snapshot["estimated_logits_mib"])
         self.assertEqual(snapshot["memory_estimate"]["selected_batch"], 1)
         self.assertEqual(snapshot["memory_estimate"]["heads"], 2)
@@ -758,7 +769,7 @@ class AnimaAFMTests(unittest.TestCase):
         self.assertEqual(seen["block_path"], "diffusion_model.blocks.1.cross_attn")
         self.assertEqual(seen["stage_tag"], "middle")
 
-    def test_block_metadata_wrapper_exposes_4d_input_shape_candidate(self):
+    def test_block_metadata_wrapper_does_not_guess_4d_layout(self):
         original = MetadataEchoCrossAttention()
         wrapper = AnimaAFMBlockMetadataWrapper(
             original=original,
@@ -772,8 +783,7 @@ class AnimaAFMTests(unittest.TestCase):
 
         seen = original.seen[0]
         info = infer_spatial_shape(2304, AFMConfig(spatial_shape_mode="auto"), seen, {})
-        self.assertEqual(info.shape, (36, 64))
-        self.assertEqual(info.source, "runtime_metadata")
+        self.assertIsNone(info.shape)
         self.assertNotIn("afm_spatial_shape_candidates", options)
 
     def test_install_anima_block_metadata_wrappers_uses_object_patches(self):
@@ -794,7 +804,7 @@ class AnimaAFMTests(unittest.TestCase):
         q = torch.randn(1, 2, 16, 4)
         k = torch.randn(1, 2, 5, 4)
         v = torch.randn(1, 2, 5, 4)
-        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2, spectral_diag="sampled"))
+        override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2, spectral_diag="sampled", diagnostic_top_k=2))
         override(
             reference_attention,
             q,
@@ -803,6 +813,7 @@ class AnimaAFMTests(unittest.TestCase):
             2,
             skip_reshape=True,
             transformer_options={
+                "afm_spatial_shape": [4, 4],
                 "sigmas": torch.tensor([0.5]),
                 "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
             },
@@ -818,7 +829,7 @@ class AnimaAFMTests(unittest.TestCase):
         k = torch.randn(1, 2, 5, 4)
         v = torch.randn(1, 2, 5, 4)
         override = AnimaAFMAttentionOverride(AFMConfig(
-            spectral_diag="sampled",
+            spectral_diag="sampled", diagnostic_top_k=2,
             diagnostic_call_indices="all",
             diagnostic_branch="selected_mean",
             debug_level="verbose",
@@ -850,7 +861,7 @@ class AnimaAFMTests(unittest.TestCase):
         v = torch.randn(2, 2, 5, 4)
         override = AnimaAFMAttentionOverride(AFMConfig(
             strength=0.2,
-            spectral_diag="sampled",
+            spectral_diag="sampled", diagnostic_top_k=2,
             diagnostic_branch="both_separate",
             debug_level="summary",
             debug_format="jsonl",
@@ -874,7 +885,7 @@ class AnimaAFMTests(unittest.TestCase):
         override = AnimaAFMAttentionOverride(AFMConfig(
             strength=0.2,
             branch_mode="positive_only",
-            spectral_diag="sampled",
+            spectral_diag="sampled", diagnostic_top_k=2,
             diagnostic_branch="both_separate",
             diagnostic_include_unselected=True,
             debug_level="summary",
@@ -952,7 +963,7 @@ class AnimaAFMTests(unittest.TestCase):
         override = AnimaAFMAttentionOverride(AFMConfig(
             mode="observe",
             strength=0.0,
-            spectral_diag="sampled",
+            spectral_diag="sampled", diagnostic_top_k=2,
             diagnostic_branch="both_separate",
             debug_level="summary",
             debug_format="jsonl",
@@ -980,7 +991,7 @@ class AnimaAFMTests(unittest.TestCase):
         k = torch.randn(2, 2, 5, 4)
         v = torch.randn(2, 2, 5, 4)
         override = AnimaAFMAttentionOverride(AFMConfig(
-            spectral_diag="sampled",
+            spectral_diag="sampled", diagnostic_top_k=2,
             diagnostic_branch="selected_mean",
             diagnostic_call_indices="0,2",
             diagnostic_every_n_steps=2,
@@ -1110,9 +1121,11 @@ class AnimaAFMTests(unittest.TestCase):
         q = torch.randn(2, 2, 16, 4)
         k = torch.randn(2, 2, 5, 4)
         v = torch.randn(2, 2, 5, 4)
-        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="summary", debug_format="jsonl"))
+        override = AnimaAFMAttentionOverride(AFMConfig(debug_level="summary", debug_format="jsonl", spatial_shape_mode="square_only"))
+        kwargs = self._cfg_kwargs(0.5)
+        kwargs["transformer_options"].pop("afm_spatial_shape")
         with self.assertLogs("anima_afm", level="INFO") as logs:
-            override(reference_attention, q, k, v, 2, **self._cfg_kwargs(0.5))
+            override(reference_attention, q, k, v, 2, **kwargs)
         records = self._json_log_records(logs.records)
         snapshot = [record for record in records if record["record_type"] == "step_snapshot"][0]
         discovery = [record for record in records if record["record_type"] == "metadata_discovery"][0]
@@ -1166,7 +1179,7 @@ class AnimaAFMTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             jsonl_path = str(Path(temp_dir) / "afm-debug.jsonl")
             override = AnimaAFMAttentionOverride(AFMConfig(
-                spectral_diag="sampled",
+                spectral_diag="sampled", diagnostic_top_k=2,
                 debug_level="summary",
                 debug_format="jsonl",
                 jsonl_path=jsonl_path,
@@ -1379,8 +1392,10 @@ class AnimaAFMTests(unittest.TestCase):
             latent_height=3,
         )
         override = AnimaAFMAttentionOverride(config)
-        out = override(reference_attention, q, k, v, 2, **self._cfg_kwargs(1.0))
-        baseline = reference_attention(q, k, v, 2, **self._cfg_kwargs(1.0))
+        kwargs = self._cfg_kwargs(1.0)
+        kwargs["transformer_options"]["afm_spatial_shape"] = [3, 4]
+        out = override(reference_attention, q, k, v, 2, **kwargs)
+        baseline = reference_attention(q, k, v, 2, **kwargs)
         self.assertEqual(override.stats.edited_calls, 1)
         self.assertEqual(override.stats.steps[0].shape_counts["q12,k5,h2,d4"], 1)
         self.assertFalse(torch.allclose(out, baseline))
@@ -1407,7 +1422,7 @@ class AnimaAFMTests(unittest.TestCase):
         v = torch.randn(1, 2, 5, 4)
         override = AnimaAFMAttentionOverride(AFMConfig(strength=0.2))
         override(reference_attention, q, k, v, 2, **self._cfg_kwargs(1.0))
-        self.assertEqual(override.stats.fallback_reasons["spatial_shape_missing"], 1)
+        self.assertEqual(override.stats.fallback_reasons["spatial_shape_metadata_invalid"], 1)
 
 
 if __name__ == "__main__":
